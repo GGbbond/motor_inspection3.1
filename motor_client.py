@@ -116,7 +116,7 @@ class MotorControlApp(QMainWindow):
         self.spin_pos_vel_pos.valueChanged.connect(self.update_target_pos_from_pos_vel)
 
         self.spin_pos_vel_velocity = QDoubleSpinBox() 
-        self.spin_pos_vel_velocity.setRange(0.1, 10.0)
+        self.spin_pos_vel_velocity.setRange(0.0, 90.0)
         self.spin_pos_vel_velocity.setSingleStep(0.1)
         self.spin_pos_vel_velocity.setValue(1.0)
         self.spin_pos_vel_velocity.setStyleSheet("color: white;")
@@ -142,7 +142,7 @@ class MotorControlApp(QMainWindow):
         self.lbl_target_torque = QLabel("目标电机反馈扭矩: 0.00 N·m")
         self.lbl_pos = QLabel("当前位置: 0.00 deg")
         self.lbl_target_pos = QLabel("目标位置: 0.00 deg")
-        self.lbl_vel = QLabel("实时速度: 0.00 deg/s")
+        self.lbl_vel = QLabel("当前速度: 0.00 deg/s")
         self.lbl_target_vel = QLabel("目标速度: 0.00 deg/s")
         self.lbl_max_torque = QLabel("电机反馈扭矩最大值: 0.00 N·m")
         self.lbl_actual_torque = QLabel("位置计算出的扭矩: 0.00 N·m")
@@ -169,7 +169,7 @@ class MotorControlApp(QMainWindow):
         data_layout.addWidget(self.btn_reset_max_torque)
         
         # 添加当前位置归零按钮
-        self.btn_zero_pos = QPushButton("当前位置归零")
+        self.btn_zero_pos = QPushButton("当前位置置零(需在电机失能状态下使用)")
         self.btn_zero_pos.setStyleSheet("background-color: #FF9800; color: white; font-size: 12px; padding: 5px;")
         self.btn_zero_pos.clicked.connect(self.set_zero_position)
         data_layout.addWidget(self.btn_zero_pos)
@@ -188,6 +188,20 @@ class MotorControlApp(QMainWindow):
         
         data_group.setLayout(data_layout)
         control_layout.addWidget(data_group)
+
+
+        #一键测试功能组
+        test_group = QGroupBox("一键测试")
+        test_layout = QGridLayout()
+
+        self.btn_test = QPushButton("一键测试")
+        self.btn_test.setStyleSheet("background-color: #E91E63; color: white; font-size: 12px; padding: 5px;")
+        self.btn_test.clicked.connect(self.run_test)
+        test_layout.addWidget(self.btn_test, 0, 0)
+        test_group.setLayout(test_layout)
+        control_layout.addWidget(test_group)
+
+
         
         # 添加弹性空间
         control_layout.addStretch()
@@ -349,6 +363,34 @@ class MotorControlApp(QMainWindow):
         # self.spin_pos_vel_pos.setValue(0.0)
     # ------------------------------------
 
+    #电机失能方法
+    def motor_disable(self):
+        if self.is_connected and self.sock:
+            try:
+                cmd = "DISABLE_MOTOR\n"
+                self.sock.sendall(cmd.encode('utf-8'))
+                print("Sent motor disable command")
+            except Exception as e:
+                print(f"发送失败: {e}")
+                self.disconnect()
+
+    #一键测试方法
+    def run_test(self):
+        if not self.is_connected or not self.sock:
+            return
+
+        # 先失能电机并发送清零命令，后续动作用定时器顺序执行
+        self.motor_disable()
+        self.set_zero_position()
+
+        # 0.2s 后开始位置清零动作完成后继续执行
+        QTimer.singleShot(200, lambda: self.position_with_velocity(360.0, 0.0, 36.0))
+        # 13s 后执行第二次位置命令
+        QTimer.singleShot(13000, lambda: self.position_with_velocity(-360.0, 0.0, 36.0))
+        # 再过13s 失能电机
+        QTimer.singleShot(26000, self.motor_disable)
+
+
     # --- 新增：receive_data 方法 ---
     def receive_data(self):
         if not self.is_connected or not self.sock:
@@ -446,19 +488,19 @@ class MotorControlApp(QMainWindow):
             self.curve_actual_torque.setData(self.actual_torque_data)
             
             # 更新标签
-            self.lbl_torque.setText(f"当前扭矩: {self.current_torque_val:.2f} N·m")
-            self.lbl_target_torque.setText(f"目标扭矩: {self.target_torque:.2f} N·m")
+            self.lbl_torque.setText(f"电机反馈扭矩: {self.current_torque_val:.2f} N·m")
+            self.lbl_target_torque.setText(f"目标电机反馈扭矩: {self.target_torque:.2f} N·m")
             self.lbl_pos.setText(f"当前位置: {self.current_pos_val:.2f} deg")
             self.lbl_target_pos.setText(f"目标位置: {self.target_pos:.2f} deg")
             self.lbl_vel.setText(f"当前速度: {self.current_vel_val:.2f} deg/s")
             self.lbl_target_vel.setText(f"目标速度: {self.target_vel:.2f} deg/s")
-            self.lbl_max_torque.setText(f"最大扭矩: {self.max_torque:.2f} N·m")
-            self.lbl_actual_torque.setText(f"实际扭矩: {self.actual_torque_val:.2f} N·m")
+            self.lbl_max_torque.setText(f"电机反馈扭矩最大值: {self.max_torque:.2f} N·m")
+            self.lbl_actual_torque.setText(f"位置计算出的扭矩: {self.actual_torque_val:.2f} N·m")
     # ------------------------------
 
     def reset_max_torque(self):
         self.max_torque = 0.0
-        self.lbl_max_torque.setText(f"最大扭矩: {self.max_torque:.2f} N·m")
+        self.lbl_max_torque.setText(f"电机反馈扭矩最大值: {self.max_torque:.2f} N·m")
         
     def set_zero_position(self):
         # 向C端发送ZERO指令，以调用mit_protocol的Zero实现电机绝对位置归零

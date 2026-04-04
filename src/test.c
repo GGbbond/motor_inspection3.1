@@ -197,8 +197,14 @@ void* tcp_server_thread(void* arg) {
                 zero_msg.can_dlc = 8;
                 Zero(&zero_msg);
                 can_commu_send(g_motor[0].can, (char *)&zero_msg, sizeof(zero_msg));
+                printf("g_motor[0].state.p: %.2f\n", g_motor[0].state.p / 3.1415926f * 180.0f); // 打印当前角度
 
                 printf("Received ZERO command\n");
+            }
+            else if (strncmp(buffer, "DISABLE_MOTOR", 13) == 0) {
+                motor_enable(&g_motor[0], 0);
+                motor_enable(&g_motor[1], 0);
+                printf("Motor disabled\n");
             }
         }
     }
@@ -512,8 +518,8 @@ int motor_test_init()
     g_motor[1].can_tx.can_dlc = 8;
     g_motor[1].can_tx.can_id = MOTOR_2_ID;
 
-    // 使能电机以便实时获取 CAN 数据
-    motor_enable(&g_motor[0], 1);
+    // // 使能电机以便实时获取 CAN 数据
+    // motor_enable(&g_motor[0], 1);
 
     pthread_t t_id2;
     if (-1 == pthread_create(&t_id2, NULL, commu_thread, (void *)g_motor))
@@ -1165,8 +1171,8 @@ int position_with_velocity(int argc, char *argv[])
     if (argc >= 2) {
         float relative_pos = atof(argv[1]);
         // 限制在-180到180度范围内
-        if (relative_pos > 180.0f) relative_pos = 180.0f;
-        if (relative_pos < -180.0f) relative_pos = -180.0f;
+        if (relative_pos > 360.0f) relative_pos = 360.0f;
+        if (relative_pos < -360.0f) relative_pos = -360.0f;
         // 将相对角度转换为弧度
         target_pos = relative_pos / 180.0f * 3.1415926f;
     }

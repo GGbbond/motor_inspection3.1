@@ -1,3 +1,0 @@
-/home/bxi/BXI/motor_detect3.1/build/CMakeFiles/motor_test.dir
-/home/bxi/BXI/motor_detect3.1/build/CMakeFiles/edit_cache.dir
-/home/bxi/BXI/motor_detect3.1/build/CMakeFiles/rebuild_cache.dir

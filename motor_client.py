@@ -56,7 +56,7 @@ class MotorControlApp(QMainWindow):
         self.actual_torque_data = np.zeros(self.data_length)
         
         # 物理参数
-        self.L = 0.45  # 哑铃力臂长度 (m)
+        self.L = 0.40  # 哑铃力臂长度 (m)
         self.m_dumbell = 10.0  # 哑铃质量 (kg)
         self.m_arm = 3.0  # 摆臂质量 (kg)
         self.g = 9.81  # 重力加速度 (m/s²)

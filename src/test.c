@@ -345,7 +345,6 @@ void *commu_thread(void *arg)
 
         // continue;
 
-
         for (size_t i = 0; i < MOTOR_NUM; i++)
         {
             motor_mit *motor = &tmp[i];
@@ -486,12 +485,12 @@ int motor_test_init()
 
     g_motor[0].param.max_pos = 12.5;
     g_motor[0].param.max_vel = 45;
-    g_motor[0].param.max_torque = 18;  // 根据测试电机修改 
+    g_motor[0].param.max_torque = 80;  // 根据测试电机修改 
     g_motor[0].protocol = 0;
 
     g_motor[1].param.max_pos = 12.5;
     g_motor[1].param.max_vel = 45;
-    g_motor[1].param.max_torque = 18;
+    g_motor[1].param.max_torque = 80;
     g_motor[1].protocol = 0;
 
     g_motor[0].can = can_commu_init("can0", "can0", 0, 0xffff, motor_test_can_call, (void *)g_motor, NULL, 0);
@@ -1222,9 +1221,9 @@ int position_with_velocity(int argc, char *argv[])
         float elapsed_time = (current_time.tv_sec - start_time.tv_sec) + 
                             (current_time.tv_usec - start_time.tv_usec) / 1000000.0f;
         
-        // 如果已经超过总时间，设置为目标位置
+        // 如果已经超过总时间，退出循环
         if (elapsed_time >= total_time) {
-            g_motor[0].control.p_des = start_pos + target_pos;  // 起始位置 + 相对距离
+            break; 
         } else {
             // 使用线性插值计算当前位置
             float progress = elapsed_time / total_time;
@@ -1233,14 +1232,14 @@ int position_with_velocity(int argc, char *argv[])
 
         
         // 打印位置信息（当位置变化超过0.01rad时）
-        if (fabs(g_motor[0].state.p - last_pos) > 0.01) {
-            // printf("p_des: %.3f, Current Position: %.3f, Torque: %.3f, Current_Torque: %.3f\n", 
-            //        g_motor[0].control.p_des / 3.1415926f * 180.0f, 
-            //        g_motor[0].state.p / 3.1415926f * 180.0f, 
-            //        g_motor[0].control.t_ff, 
-            //        g_motor[0].state.t);
-            last_pos = g_motor[0].state.p;
-        }
+        // if (fabs(g_motor[0].state.p - last_pos) > 0.01) {
+        //     printf("p_des: %.3f, Current Position: %.3f, Torque: %.3f, Current_Torque: %.3f\n", 
+        //            g_motor[0].control.p_des / 3.1415926f * 180.0f, 
+        //            g_motor[0].state.p / 3.1415926f * 180.0f, 
+        //            g_motor[0].control.t_ff, 
+        //            g_motor[0].state.t);
+        //     last_pos = g_motor[0].state.p;
+        // }
         
 
         // 检查是否已经到达目标位置（允许一定误差）

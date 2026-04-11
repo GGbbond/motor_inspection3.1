@@ -496,12 +496,12 @@ int motor_test_init()
 
     g_motor[0].param.max_pos = 12.5;
     g_motor[0].param.max_vel = 45;
-    g_motor[0].param.max_torque = 80;  // 根据测试电机修改 
+    g_motor[0].param.max_torque = 40;  // 根据测试电机修改 
     g_motor[0].protocol = 0;
 
     g_motor[1].param.max_pos = 12.5;
     g_motor[1].param.max_vel = 45;
-    g_motor[1].param.max_torque = 80;
+    g_motor[1].param.max_torque = 40;
     g_motor[1].protocol = 0;
 
     g_motor[0].can = can_commu_init("can0", "can0", 0, 0xffff, motor_test_can_call, (void *)g_motor, NULL, 0);

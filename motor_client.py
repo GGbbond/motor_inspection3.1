@@ -193,6 +193,22 @@ class MotorControlApp(QMainWindow):
         data_group.setLayout(data_layout)
         control_layout.addWidget(data_group)
 
+        #添加力臂长度输入框
+        arm_layout = QHBoxLayout()
+        arm_layout.addWidget(QLabel("力臂长度 (m):"))
+        self.spin_arm_length = QDoubleSpinBox()
+        self.spin_arm_length.setRange(0.1, 1.0)
+        self.spin_arm_length.setSingleStep(0.01)
+        self.spin_arm_length.setValue(self.L)  # 使用默认值
+        self.spin_arm_length.setStyleSheet("color: white;")
+        self.spin_arm_length.valueChanged.connect(self.update_arm_length)
+        arm_layout.addWidget(self.spin_arm_length)
+        data_layout.addLayout(arm_layout)
+
+        data_group.setLayout(data_layout)
+        control_layout.addWidget(data_group)
+
+
         # #添加力臂长度输入框
         # arm_layout = QHBoxLayout()
         # arm_layout.addWidget(QLabel("力臂长度 (m):"))
@@ -465,6 +481,24 @@ class MotorControlApp(QMainWindow):
             except Exception as e:
                 print(f"发送失败: {e}")
                 self.disconnect()
+
+        #当btn等于self.btn_max_torque_1时，将self.m_dumbell设置为2.0kg,self.L设置为0.45m
+        #当btn等于self.btn_max_torque_2时，将self.m_dumbell设置为5.0kg,self.L设置为0.45m
+        #当btn等于self.btn_max_torque_3时，将self.m_dumbell设置为10.0kg,self.L设置为0.35m
+        #当btn等于self.btn_max_torque_4时，将self.m_dumbell设置为27.0kg,self.L设置为0.50m
+        if btn == self.btn_max_torque_1:
+            self.m_dumbell = 2.0
+            self.L = 0.45
+        elif btn == self.btn_max_torque_2:
+            self.m_dumbell = 5.0
+            self.L = 0.45
+        elif btn == self.btn_max_torque_3:
+            self.m_dumbell = 10.0
+            self.L = 0.35
+        elif btn == self.btn_max_torque_4:
+            self.m_dumbell = 27.0
+            self.L = 0.50
+
     
 
     # --- 新增：receive_data 方法 ---
@@ -541,6 +575,9 @@ class MotorControlApp(QMainWindow):
             self.pos_data = np.roll(self.pos_data, -1)
             self.pos_data[-1] = self.current_pos_val
 
+            self.spin_dumbell_weight.setValue(self.m_dumbell)
+            self.spin_arm_length.setValue(self.L) 
+
             # 计算速度（deg/s）
             dt = 0.1  # update_data 每100ms调用一次
             self.current_vel_val = abs((self.current_pos_val - self.last_pos_val) / dt) #当前速度的绝对值
@@ -603,6 +640,10 @@ class MotorControlApp(QMainWindow):
     def update_dumbell_weight(self, value):
         """更新哑铃重量"""
         self.m_dumbell = value
+
+    def update_arm_length(self, value):
+        """更新力臂长度"""
+        self.L = value
         
     # --- 新增：closeEvent 方法 ---
     def closeEvent(self, event):

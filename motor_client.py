@@ -11,6 +11,7 @@ from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QFont
 import pyqtgraph as pg
 
+
 # --- 新增：资源路径处理函数 ---
 def resource_path(relative_path):
     """ 获取资源绝对路径，适配 PyInstaller 打包后的路径 """
@@ -46,7 +47,8 @@ class MotorControlApp(QMainWindow):
         self.max_torque = 0.0
         self.actual_torque_val = 0.0
         self.pos_offset = 0.0  # 位置偏移，用于归零
-        self.data_length = 100
+        self.data_length = 260  # 26 seconds at 100ms update interval
+        self.time_axis = np.linspace(-26.0, 0.0, self.data_length)
         self.torque_data = np.zeros(self.data_length)
         self.target_torque_data = np.zeros(self.data_length)
         self.pos_data = np.zeros(self.data_length)
@@ -56,7 +58,7 @@ class MotorControlApp(QMainWindow):
         self.actual_torque_data = np.zeros(self.data_length)
         
         # 物理参数
-        self.L = 0.40  # 哑铃力臂长度 (m)
+        self.L = 0.35 # 哑铃力臂长度 (m)
         self.m_dumbell = 10.0  # 哑铃质量 (kg)
         self.m_arm = 3.0  # 摆臂质量 (kg)
         self.g = 9.81  # 重力加速度 (m/s²)
@@ -280,9 +282,13 @@ class MotorControlApp(QMainWindow):
         self.torque_plot.setBackground('k')
         self.torque_plot.showGrid(x=True, y=True)
         self.torque_plot.setLabel('left', '扭矩', units='N·m')
+        self.torque_plot.setLabel('bottom', '时间', units='s')
         self.torque_plot.addLegend()
         
         self.curve_torque = self.torque_plot.plot(pen='y', name='电机反馈扭矩')
+        self.curve_actual_torque = self.torque_plot.plot(pen='b', name='位置计算出的扭矩')
+
+
         # self.curve_target_torque = self.torque_plot.plot(pen='r', name='目标电机反馈扭矩')
         
         # 位置图表
@@ -290,6 +296,7 @@ class MotorControlApp(QMainWindow):
         self.pos_plot.setBackground('k')
         self.pos_plot.showGrid(x=True, y=True)
         self.pos_plot.setLabel('left', '位置', units='deg')
+        self.pos_plot.setLabel('bottom', '时间', units='s')
         self.pos_plot.addLegend()
         
         self.curve_pos = self.pos_plot.plot(pen='g', name='实时位置')
@@ -300,25 +307,26 @@ class MotorControlApp(QMainWindow):
         self.vel_plot.setBackground('k')
         self.vel_plot.showGrid(x=True, y=True)
         self.vel_plot.setLabel('left', '速度', units='deg/s')
+        self.vel_plot.setLabel('bottom', '时间', units='s')
         self.vel_plot.addLegend()
 
         self.curve_vel = self.vel_plot.plot(pen=pg.mkPen('magenta', width=3), name='实时速度')
         self.curve_target_vel = self.vel_plot.plot(pen=pg.mkPen('cyan', width=2, style=Qt.DashLine), name='目标速度')
         
-        # 实际扭矩图表
-        self.actual_torque_plot = pg.PlotWidget(title="位置计算出的扭矩曲线")
-        self.actual_torque_plot.setBackground('k')
-        self.actual_torque_plot.showGrid(x=True, y=True)
-        self.actual_torque_plot.setLabel('left', '扭矩', units='N·m')
-        self.actual_torque_plot.addLegend()
+        # # 实际扭矩图表
+        # self.actual_torque_plot = pg.PlotWidget(title="位置计算出的扭矩曲线")
+        # self.actual_torque_plot.setBackground('k')
+        # self.actual_torque_plot.showGrid(x=True, y=True)
+        # self.actual_torque_plot.setLabel('left', '扭矩', units='N·m')
+        # self.actual_torque_plot.addLegend()
         
-        self.curve_actual_torque = self.actual_torque_plot.plot(pen='b', name='位置计算出的扭矩')
+        # self.curve_actual_torque = self.actual_torque_plot.plot(pen='b', name='位置计算出的扭矩')
         
         # 添加图表到布局
         chart_layout.addWidget(self.torque_plot)
         chart_layout.addWidget(self.pos_plot)
         chart_layout.addWidget(self.vel_plot)
-        chart_layout.addWidget(self.actual_torque_plot)
+        # chart_layout.addWidget(self.actual_torque_plot)
         
         # 添加左右面板到主布局
         main_layout.addWidget(control_panel, 1)
@@ -446,6 +454,8 @@ class MotorControlApp(QMainWindow):
         if not self.is_connected or not self.sock:
             return
 
+        self.max_torque = 0.0
+        self.lbl_max_torque.setText(f"电机反馈扭矩最大值: {self.max_torque:.2f} N·m")
         # 先失能电机并发送清零命令，后续动作用定时器顺序执行
         self.motor_disable()
         self.set_zero_position()
@@ -465,6 +475,8 @@ class MotorControlApp(QMainWindow):
 
     #设置max_torque方法
     def set_max_torque(self, value, btn):
+        if not self.is_connected or not self.sock:
+            return
         """设置电机的最大扭矩"""
         # 如果之前有选中的按钮，恢复其样式
         if self.current_max_torque_btn:
@@ -496,7 +508,7 @@ class MotorControlApp(QMainWindow):
             self.m_dumbell = 10.0
             self.L = 0.35
         elif btn == self.btn_max_torque_4:
-            self.m_dumbell = 27.0
+            self.m_dumbell = 25.0
             self.L = 0.50
 
     
@@ -598,13 +610,13 @@ class MotorControlApp(QMainWindow):
             self.actual_torque_data[-1] = self.actual_torque_val
             
             # 更新图表
-            self.curve_torque.setData(self.torque_data)
-            # self.curve_target_torque.setData(self.target_torque_data)
-            self.curve_pos.setData(self.pos_data)
-            self.curve_target_pos.setData(self.target_pos_data)
-            self.curve_vel.setData(self.vel_data)
-            self.curve_target_vel.setData(self.target_vel_data)
-            self.curve_actual_torque.setData(self.actual_torque_data)
+            self.curve_torque.setData(self.time_axis, self.torque_data)
+            # self.curve_target_torque.setData(self.time_axis, self.target_torque_data)
+            self.curve_pos.setData(self.time_axis, self.pos_data)
+            self.curve_target_pos.setData(self.time_axis, self.target_pos_data)
+            self.curve_vel.setData(self.time_axis, self.vel_data)
+            self.curve_target_vel.setData(self.time_axis, self.target_vel_data)
+            self.curve_actual_torque.setData(self.time_axis, self.actual_torque_data)
             
             # 更新标签
             self.lbl_torque.setText(f"电机反馈扭矩: {self.current_torque_val:.2f} N·m")
@@ -648,6 +660,7 @@ class MotorControlApp(QMainWindow):
     # --- 新增：closeEvent 方法 ---
     def closeEvent(self, event):
         self.disconnect()
+            
         event.accept()
     # ---------------------------
 

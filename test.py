@@ -35,7 +35,10 @@ class MotorControlApp(QMainWindow):
         self.target_vel = 0.0
         self.current_torque_val1 = 0.0
         self.current_pos_val1 = 0.0
-        self.current_vel_val = 0.0
+        self.current_vel_val1 = 0.0
+        self.current_torque_val2 = 0.0
+        self.current_pos_val2 = 0.0
+        self.current_vel_val2 = 0.0
         self.last_pos_val = 0.0
         self.max_torque = 0.0
         self.actual_torque_val = 0.0
@@ -49,10 +52,13 @@ class MotorControlApp(QMainWindow):
         # 绘图数据
         self.data_length = 260
         self.time_axis = np.linspace(-26.0, 0.0, self.data_length)
-        self.torque_data = np.zeros(self.data_length)
-        self.pos_data = np.zeros(self.data_length)
+        self.torque_data1 = np.zeros(self.data_length)
+        self.torque_data2 = np.zeros(self.data_length)
+        self.pos_data1 = np.zeros(self.data_length)
+        self.pos_data2 = np.zeros(self.data_length)
         self.target_pos_data = np.zeros(self.data_length)
-        self.vel_data = np.zeros(self.data_length)
+        self.vel_data1 = np.zeros(self.data_length)
+        self.vel_data2 = np.zeros(self.data_length)
         self.target_vel_data = np.zeros(self.data_length)
         self.actual_torque_data = np.zeros(self.data_length)
         
@@ -121,23 +127,26 @@ class MotorControlApp(QMainWindow):
         
         # 扭矩图
         self.plot_torque = pg.PlotWidget(title="扭矩反馈 (N·m)")
-        self.curve_torque = self.plot_torque.plot(pen='y', name='反馈扭矩')
+        self.curve_torque1 = self.plot_torque.plot(pen='y', name='电机1反馈扭矩')
+        self.curve_torque2 = self.plot_torque.plot(pen='m', name='电机2反馈扭矩')
         self.curve_actual_torque = self.plot_torque.plot(pen='b', name='计算扭矩')
         
         # 位置图
         self.plot_pos = pg.PlotWidget(title="实时位置 (deg)")
-        self.curve_pos = self.plot_pos.plot(pen='g', name='当前位置')
+        self.curve_pos1 = self.plot_pos.plot(pen='g', name='电机1位置')
+        self.curve_pos2 = self.plot_pos.plot(pen='c', name='电机2位置')
         self.curve_target_pos = self.plot_pos.plot(pen='c', name='目标位置')
         
         # 速度图
         self.plot_vel = pg.PlotWidget(title="实时速度 (deg/s)")
-        self.curve_vel = self.vel_plot = self.plot_vel.plot(pen=pg.mkPen('magenta', width=2), name='当前速度')
+        self.curve_vel1 = self.plot_vel.plot(pen=pg.mkPen('magenta', width=2), name='电机1速度')
+        self.curve_vel2 = self.plot_vel.plot(pen=pg.mkPen('green', width=2), name='电机2速度')
         self.curve_target_vel = self.plot_vel.plot(pen=pg.mkPen('cyan', width=1, style=Qt.DashLine), name='目标速度')
 
         for p in [self.plot_torque, self.plot_pos, self.plot_vel]:
             p.showGrid(x=True, y=True)
             p.addLegend()
-            p.setBackground('#121212')
+            p.setBackground("#121212")
             right_layout.addWidget(p)
 
         main_layout.addWidget(right_container, 3)
@@ -145,7 +154,6 @@ class MotorControlApp(QMainWindow):
     def init_basic_page(self):
         """构建基础控制页面"""
         layout = QVBoxLayout(self.page_basic)
-        
         # 连接控制组
         conn_group = QGroupBox("系统连接")
         conn_layout = QVBoxLayout()
@@ -195,6 +203,22 @@ class MotorControlApp(QMainWindow):
         """构建高级调试页面"""
         layout = QVBoxLayout(self.page_debug)
 
+        #数据面板
+        debug_data_group = QGroupBox("实时数据")
+        debug_data_layout = QVBoxLayout()
+        self.lbl_debug_torque_val1 = QLabel("电机 1 当前扭矩: 0.00 Nm")
+        self.lbl_debug_pos_val1 = QLabel("电机 1 当前位置: 0.00 deg")
+        self.lbl_debug_vel_val1 = QLabel("电机 1 当前速度: 0.00 deg/s")
+        self.lbl_debug_torque_val2 = QLabel("电机 2 当前扭矩: 0.00 Nm")
+        self.lbl_debug_pos_val2 = QLabel("电机 2 当前位置: 0.00 deg")
+        self.lbl_debug_vel_val2 = QLabel("电机 2 当前速度: 0.00 deg/s")
+        for lbl in [self.lbl_debug_torque_val1, self.lbl_debug_pos_val1, self.lbl_debug_vel_val1, 
+                    self.lbl_debug_torque_val2, self.lbl_debug_pos_val2, self.lbl_debug_vel_val2]:
+            lbl.setStyleSheet("font-size: 15px; color: #ffffff; padding: 5px;")
+            debug_data_layout.addWidget(lbl)
+        debug_data_group.setLayout(debug_data_layout)
+        layout.addWidget(debug_data_group)
+        
         # 选型设置
         motor_group = QGroupBox("电机型号/Max Torque")
         motor_layout = QGridLayout()
@@ -295,42 +319,62 @@ class MotorControlApp(QMainWindow):
                         self.max_torque = abs(self.current_torque_val1)
                 elif line.startswith("POS1"):
                     self.current_pos_val1 = float(line.split()[1])
+                elif line.startswith("VEL1"):
+                    self.current_vel_val1 = float(line.split()[1])
                 elif line.startswith("POS_WITH_VEL_COMPLETE"):
                     self.target_vel = 0.0
+                elif line.startswith("TORQUE2"):
+                    self.current_torque_val2 = float(line.split()[1])
+                elif line.startswith("POS2"):
+                    self.current_pos_val2 = float(line.split()[1])
+                elif line.startswith("VEL2"):
+                    self.current_vel_val2 = float(line.split()[1])
         except: pass
 
     def update_data(self):
         if not self.is_connected: return
         
         # 计算速度
-        dt = 0.1
-        self.current_vel_val = abs((self.current_pos_val1 - self.last_pos_val) / dt)
-        self.last_pos_val = self.current_pos_val1
+        # dt = 0.1
+        # self.current_vel_val = abs((self.current_pos_val1 - self.last_pos_val) / dt)
+        # self.last_pos_val = self.current_pos_val1
 
         # 物理计算
         theta_rad = self.current_pos_val1 * np.pi / 180
         self.actual_torque_val = (self.m_dumbell * self.L + self.m_arm * 0.25) * self.g * np.sin(theta_rad)
 
         # 更新缓冲区
-        self.torque_data = np.roll(self.torque_data, -1); self.torque_data[-1] = self.current_torque_val1
-        self.pos_data = np.roll(self.pos_data, -1); self.pos_data[-1] = self.current_pos_val1
+        self.torque_data1 = np.roll(self.torque_data1, -1); self.torque_data1[-1] = self.current_torque_val1
+        self.torque_data2 = np.roll(self.torque_data2, -1); self.torque_data2[-1] = self.current_torque_val2
+        self.pos_data1 = np.roll(self.pos_data1, -1); self.pos_data1[-1] = self.current_pos_val1
+        self.pos_data2 = np.roll(self.pos_data2, -1); self.pos_data2[-1] = self.current_pos_val2
         self.target_pos_data = np.roll(self.target_pos_data, -1); self.target_pos_data[-1] = self.target_pos
-        self.vel_data = np.roll(self.vel_data, -1); self.vel_data[-1] = self.current_vel_val
+        self.vel_data1 = np.roll(self.vel_data1, -1); self.vel_data1[-1] = self.current_vel_val1
+        self.vel_data2 = np.roll(self.vel_data2, -1); self.vel_data2[-1] = self.current_vel_val2
         self.target_vel_data = np.roll(self.target_vel_data, -1); self.target_vel_data[-1] = self.target_vel
         self.actual_torque_data = np.roll(self.actual_torque_data, -1); self.actual_torque_data[-1] = self.actual_torque_val
 
         # 刷新 UI 标签
         self.lbl_torque_val.setText(f"当前扭矩: {self.current_torque_val1:.2f} Nm")
         self.lbl_pos_val.setText(f"当前位置: {self.current_pos_val1:.2f} deg")
-        self.lbl_vel_val.setText(f"当前速度: {self.current_vel_val:.2f} deg/s")
+        self.lbl_vel_val.setText(f"当前速度: {self.current_vel_val1:.2f} deg/s")
+        self.lbl_debug_torque_val1.setText(f"电机 1 当前扭矩: {self.current_torque_val1:.2f} Nm")
+        self.lbl_debug_pos_val1.setText(f"电机 1 当前位置: {self.current_pos_val1:.2f} deg")
+        self.lbl_debug_vel_val1.setText(f"电机 1 当前速度: {self.current_vel_val1:.2f} deg/s")
+        self.lbl_debug_torque_val2.setText(f"电机 2 当前扭矩: {self.current_torque_val2:.2f} Nm")
+        self.lbl_debug_pos_val2.setText(f"电机 2 当前位置: {self.current_pos_val2:.2f} deg")
+        self.lbl_debug_vel_val2.setText(f"电机 2 当前速度: {self.current_vel_val2:.2f} deg/s")
         self.lbl_peak_torque.setText(f"峰值扭矩: {self.max_torque:.2f} Nm")
 
         # 刷新图表
-        self.curve_torque.setData(self.time_axis, self.torque_data)
+        self.curve_torque1.setData(self.time_axis, self.torque_data1)
+        self.curve_torque2.setData(self.time_axis, self.torque_data2)
         self.curve_actual_torque.setData(self.time_axis, self.actual_torque_data)
-        self.curve_pos.setData(self.time_axis, self.pos_data)
+        self.curve_pos1.setData(self.time_axis, self.pos_data1)
+        self.curve_pos2.setData(self.time_axis, self.pos_data2)
         self.curve_target_pos.setData(self.time_axis, self.target_pos_data)
-        self.curve_vel.setData(self.time_axis, self.vel_data)
+        self.curve_vel1.setData(self.time_axis, self.vel_data1)
+        self.curve_vel2.setData(self.time_axis, self.vel_data2)
         self.curve_target_vel.setData(self.time_axis, self.target_vel_data)
 
     def set_max_torque(self, value, btn):

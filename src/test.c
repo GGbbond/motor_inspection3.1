@@ -28,7 +28,7 @@ pthread_t server_thread;
 
 // 电机相关定义
 #define MOTOR_1_ID  1
-#define MOTOR_2_ID  2
+#define MOTOR_2_ID  6
 
 #define CAN_EFF_FLAG 0x80000000U /* EFF/SFF is set in the MSB */
 #define CAN_RTR_FLAG 0x40000000U /* remote transmission request */
@@ -75,6 +75,7 @@ motor_mit g_motor[MOTOR_NUM];
 int set_motor_tor(motor_mit *motor, float tor);
 int set_motor_vel(motor_mit *motor, float vel);
 int motor_enable(motor_mit *motor, int enable);
+int position_with_velocity(int argc, char *argv[]);
 
 // TCP服务器清理函数
 void cleanup_tcp_server() {
@@ -191,7 +192,7 @@ void* tcp_server_thread(void* arg) {
                 send(client_socket, result, strlen(result), 0);
             }
             else if(strncmp(buffer, "ZERO", 4) == 0){
-                can_frame zero_msg;
+                struct can_frame zero_msg;
                 memset(&zero_msg, 0, sizeof(zero_msg));
                 zero_msg.can_id = MOTOR_1_ID;
                 zero_msg.can_dlc = 8;
@@ -363,7 +364,6 @@ void *commu_thread(void *arg)
             if (motor->protocol == 0)
             {
                 // pthread_spin_lock(&motor->lock);
-
                 if(!enable_last[i] && motor->motor_enable)
                 {
                     //enter;
@@ -475,11 +475,13 @@ void *commu_thread(void *arg)
         // 发送状态数据到客户端
         if (client_fd > 0) {
             char msg[256];
-            snprintf(msg, sizeof(msg), "TORQUE1 %.2f\nPOS1 %.2f\nTORQUE2 %.2f\nPOS2 %.2f\n", 
+            snprintf(msg, sizeof(msg), "TORQUE1 %.2f\nPOS1 %.2f\nVEL1 %.2f\nTORQUE2 %.2f\nPOS2 %.2f\nVEL2 %.2f\n", 
                     g_motor[0].state.t, 
                     g_motor[0].state.p / 3.1415926f * 180.0f,  // 弧度转角度
+                    g_motor[0].state.v,
                     g_motor[1].state.t,
-                    g_motor[1].state.p / 3.1415926f * 180.0f); // 弧度转角度
+                    g_motor[1].state.p / 3.1415926f * 180.0f,  // 弧度转角度
+                    g_motor[1].state.v);
             send(client_fd, msg, strlen(msg), 0);
             usleep(1000*10);
         }
@@ -498,7 +500,7 @@ int motor_test_init()
 
     g_motor[0].param.max_pos = 12.5;
     g_motor[0].param.max_vel = 45;
-    g_motor[0].param.max_torque = 40;  // 根据测试电机修改 
+    g_motor[0].param.max_torque = 80;  // 根据测试电机修改 
     g_motor[0].protocol = 0;
 
     g_motor[1].param.max_pos = 12.5;
@@ -517,7 +519,7 @@ int motor_test_init()
     g_motor[1].control.kp = 0.0;
     g_motor[1].control.kd = 0.0;
     g_motor[1].pid.kp = 0.5;
-    g_motor[1].pid.ki = 0.0;
+    g_motor[1].pid.ki = 0.1;
     g_motor[1].pid.output_max = 40.0;
     g_motor[1].pid.error_all_max = g_motor[1].pid.output_max / g_motor[1].pid.ki;
     g_motor[1].pid.error_max = 4.0;
@@ -795,7 +797,7 @@ int vves_test(int argc, char *argv[])
 
     motor_enable( &g_motor[1], 1);
 
-    g_motor[1].pid.des = 3.0f;   // 根据电机相对方向修改，若反向则为正，同向则为负
+    g_motor[1].pid.des = 5.0f;   // 根据电机相对方向修改，若反向则为正，同向则为负
     usleep(1000*200);
  
     printf("current, torque\n");
@@ -1136,20 +1138,20 @@ int position_with_velocity(int argc, char *argv[])
 
     
     // 设置协议0模式
-    g_motor[0].protocol = 0;
+    g_motor[1].protocol = 0;
     
     // 配置MIT协议控制参数
-    g_motor[0].control.kp = 300.0;  // 位置比例增益
-    g_motor[0].control.kd = 5.0;    // 速度阻尼增益，增加阻尼以减少震荡
+    g_motor[1].control.kp = 300.0;  // 位置比例增益
+    g_motor[1].control.kd = 5.0;    // 速度阻尼增益，增加阻尼以减少震荡
     
     // 使能电机
-    motor_enable(&g_motor[0], 1);
+    motor_enable(&g_motor[1], 1);
     
     // 设置输出力矩
-    g_motor[0].control.t_ff = torque;
+    g_motor[1].control.t_ff = torque;
     
     // 设置起始位置为当前位置
-    float start_pos = g_motor[0].state.p;
+    float start_pos = g_motor[1].state.p;
     float current_des = start_pos;
     
     printf("Start Position: %.3f deg, Target Position: %.3f deg, Velocity: %.3f deg/s, Torque: %.3f Nm\n", 
@@ -1181,7 +1183,7 @@ int position_with_velocity(int argc, char *argv[])
         } else {
             // 使用线性插值计算当前位置
             float progress = elapsed_time / total_time;
-            g_motor[0].control.p_des = start_pos + total_distance * progress;
+            g_motor[1].control.p_des = start_pos + total_distance * progress;
         }
 
         
@@ -1197,7 +1199,7 @@ int position_with_velocity(int argc, char *argv[])
         
 
         // 检查是否已经到达目标位置（允许一定误差）
-        if (fabs(g_motor[0].state.p - (start_pos + target_pos)) < 0.01 && elapsed_time >= total_time) {
+        if (fabs(g_motor[1].state.p - (start_pos + target_pos)) < 0.01 && elapsed_time >= total_time) {
             printf("Target position reached!\n");
             break;
         }
@@ -1212,59 +1214,107 @@ FINSH_FUNCTION_EXPORT(position_with_velocity, position_with_velocity);
 
 int drag_test(int argc, char *argv[])
 {
-    float torque,speed,power;
-    float KT = 0.07f;
-    float GR = (7056.f/361.f);
-    float target_current = -5.0f;
-
-    if (argc == 2) {
-        target_current = atof(argv[1]);
-    }
-    printf("target current: %.3f\n", target_current);
-
-    system("mkdir -p ../data");
+    float target_pos = 0.0f;  // 目标位置（角度）
+    float velocity = 1.0f;   // 转动速度（度/秒）
+    float max_torque = 0.0f;      // 输出力矩（Nm）
     
-    FILE *file = fopen("../data/current_torque.csv", "w");
-
-    if(!file)
-    {
-        printf("open file failed\n");
+    // 从命令行获取参数
+    if (argc >= 2) {
+        float relative_pos = atof(argv[1]);
+        // 限制在-180到180度范围内
+        if (relative_pos > 360.0f) relative_pos = 360.0f;
+        if (relative_pos < -360.0f) relative_pos = -360.0f;
+        // 将相对角度转换为弧度
+        target_pos = relative_pos / 180.0f * 3.1415926f;
     }
+    if (argc >= 3) velocity = atof(argv[2]);
+    if (argc >= 4) max_torque = atof(argv[3]);
+    // 速度转为弧度/秒
+    velocity = velocity / 180.0f * 3.1415926f;
 
-    g_motor[1].protocol = 2;
-
-    motor_enable( &g_motor[0], 1);
-    motor_enable( &g_motor[1], 1);
-
-    g_motor[1].pid.des = 5.0f;   // 根据电机相对方向修改，若反向则为正，同向则为负
-    usleep(1000*200);
- 
-    printf("current, torque\n");
-
-    float current = 0;
-    int times = 1000 * 2;
-    for (int i = 0; i < times; i++)
-    {
-        current += (target_current * 2.0f / times * (i >= (times/2) ? -1 : 1));
-        set_motor_tor(&g_motor[0], current);
-        usleep(1000*10);
-        get_dy200_info(&torque, &speed, &power);
-        if(i <= (times/2) && i >=50){
-            printf("%.3f, %.3f\n", current, torque);  // 修改扭矩正负输出，前面的系数根据扭矩输出修改
-            if(file){
-                fprintf(file, "%.3f, %.3f\n", current, torque);
-            }
-        }
-    }
-
-    motor_enable( &g_motor[0], 0);
-    motor_enable( &g_motor[1], 0);
-
-    g_motor[1].pid.des = 0.0f;
-
+    
+    // 设置协议0模式
+    g_motor[0].protocol = 0;
     g_motor[1].protocol = 0;
+    
+    // 配置MIT协议控制参数
+    g_motor[0].control.kp = 300.0;  // 位置比例增益
+    g_motor[0].control.kd = 5.0;    // 速度阻尼增益，增加阻尼以减少震荡
+    g_motor[1].control.kp = 300.0;  // 位置比例增益
+    g_motor[1].control.kd = 5.0;    // 速度阻尼增益，增加阻尼以减少震荡
+    
+    // 使能电机
+    motor_enable(&g_motor[0], 1);
+    motor_enable(&g_motor[1], 1);
+    
+    // 设置起始位置为当前位置
+    float start_pos = g_motor[1].state.p;
+    float current_des = start_pos;
+    
+    printf("Start Position: %.3f deg, Target Position: %.3f deg, Velocity: %.3f deg/s", 
+           start_pos / 3.1415926f * 180.0f, target_pos / 3.1415926f * 180.0f, velocity / 3.1415926f * 180.0f);//显示起始位置角度、目标位置、速度和力矩
+    
+    // 计算需要移动的总距离（相对于当前位置）
+    float total_distance = target_pos;  // 直接使用相对距离
+    float total_time = fabs(total_distance) / velocity;
+    float current_torque = 0.0f;
+    float half_time = total_time / 2.0f;
 
-    fclose(file);
+    
+    // 记录开始时间
+    struct timeval start_time, current_time;
+    gettimeofday(&start_time, NULL);
+    
+    // 记录上次打印位置
+    float last_pos = start_pos;
+    
+    while (!kbhit()) {
+        // 获取当前时间
+        gettimeofday(&current_time, NULL);
+        
+        // 计算已经过的时间（秒）
+        float elapsed_time = (current_time.tv_sec - start_time.tv_sec) + 
+                            (current_time.tv_usec - start_time.tv_usec) / 1000000.0f;
+        
+        // 如果已经超过总时间，退出循环
+        if (elapsed_time >= total_time) {
+            motor_enable(&g_motor[0], 0);
+            motor_enable(&g_motor[1], 0);
+            break; 
+        } else {
+            // 使用线性插值计算当前位置
+            float progress = elapsed_time / total_time;
+            g_motor[1].control.p_des = start_pos + total_distance * progress;
+            if (elapsed_time < half_time) {
+                // 第一阶段：0 -> max_torque
+                current_torque = max_torque * (elapsed_time / half_time);
+            } else if (elapsed_time < 2 * half_time) {
+                // 第二阶段：max_torque -> 0
+                current_torque = max_torque * (1.0f - (elapsed_time - half_time) / half_time);
+            }
+            set_motor_tor(&g_motor[0], 10.0);
+        }
+
+        
+        // 打印位置信息（当位置变化超过0.01rad时）
+        // if (fabs(g_motor[0].state.p - last_pos) > 0.01) {
+        //     printf("p_des: %.3f, Current Position: %.3f, Torque: %.3f, Current_Torque: %.3f\n", 
+        //            g_motor[0].control.p_des / 3.1415926f * 180.0f, 
+        //            g_motor[0].state.p / 3.1415926f * 180.0f, 
+        //            g_motor[0].control.t_ff, 
+        //            g_motor[0].state.t);
+        //     last_pos = g_motor[0].state.p;
+        // }
+        
+
+        // 检查是否已经到达目标位置（允许一定误差）
+        if (fabs(g_motor[1].state.p - (start_pos + target_pos)) < 0.01 && elapsed_time >= total_time) {
+            printf("Target position reached!\n");
+            break;
+        }
+        
+        usleep(1000 * 1); // 1ms更新一次
+    }
 
     return 0;
 }

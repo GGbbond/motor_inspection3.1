@@ -1,430 +1,778 @@
-import sys
-import os
 import socket
+import sys
+from dataclasses import dataclass
+
 import numpy as np
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
-                            QHBoxLayout, QLabel, QGroupBox, QPushButton, 
-                            QDoubleSpinBox, QGridLayout, QStackedWidget, QFrame)
+import pyqtgraph as pg
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QFont
-import pyqtgraph as pg
+from PyQt5.QtWidgets import (
+    QApplication,
+    QDoubleSpinBox,
+    QGridLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QPlainTextEdit,
+    QPushButton,
+    QStackedWidget,
+    QVBoxLayout,
+    QWidget,
+)
+
+
+SERVER_HOST = "127.0.0.1"
+SERVER_PORT = 9999
+PLOT_INTERVAL_MS = 100
+RX_INTERVAL_MS = 20
+DEFAULT_TEST_POS_DEG = 360.0
+DEFAULT_TEST_VEL_DEG_S = 36.0
+DEFAULT_LOAD_TORQUE_NM = 2.0
+ZERO_GUARD_DEG = 1.0
+TERMINAL_MAX_BLOCKS = 500
+TELEMETRY_KEYS = {"TORQUE1", "POS1", "VEL1", "TORQUE2", "POS2", "VEL2"}
+
+MOTOR_PRESETS = (
+    ("50 标准", 40.0, 5.0, 0.45),
+    ("50 加长", 40.0, 5.0, 0.45),
+    ("70 标准", 80.0, 10.0, 0.35),
+    ("85 标准", 160.0, 25.0, 0.50),
+)
+
+
+@dataclass
+class MotorSample:
+    torque: float = 0.0
+    position: float = 0.0
+    velocity: float = 0.0
+
 
 class MotorControlApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        
-        # --- 核心变量初始化 ---
-        self.init_variables()
-        
-        # --- UI 初始化 ---
-        self.init_ui()
-        
-        # --- 定时器设置 ---
-        self.timer = QTimer() # 绘图定时器
-        self.timer.timeout.connect(self.update_data)
-        self.timer.start(100)
-        
-        self.rx_timer = QTimer() # 数据接收定时器
-        self.rx_timer.timeout.connect(self.receive_data)
 
-    def init_variables(self):
         self.sock = None
         self.is_connected = False
-        self.target_torque = 0.0
+        self.rx_buffer = ""
+        self.test_token = 0
+
+        self.motor_1 = MotorSample()
+        self.motor_2 = MotorSample()
         self.target_pos = 0.0
         self.target_vel = 0.0
-        self.current_torque_val1 = 0.0
-        self.current_pos_val1 = 0.0
-        self.current_vel_val1 = 0.0
-        self.current_torque_val2 = 0.0
-        self.current_pos_val2 = 0.0
-        self.current_vel_val2 = 0.0
-        self.last_pos_val = 0.0
-        self.max_torque = 0.0
-        self.actual_torque_val = 0.0
-        
-        # 物理参数
-        self.L = 0.35 
-        self.m_dumbell = 10.0
-        self.m_arm = 3.0
-        self.g = 9.81
-        
-        # 绘图数据
+        self.peak_torque = 0.0
+        self.actual_torque = 0.0
+
+        self.arm_length_m = 0.35
+        self.load_mass_kg = 10.0
+        self.arm_mass_kg = 3.0
+        self.gravity = 9.81
+
         self.data_length = 260
         self.time_axis = np.linspace(-26.0, 0.0, self.data_length)
-        self.torque_data1 = np.zeros(self.data_length)
-        self.torque_data2 = np.zeros(self.data_length)
-        self.pos_data1 = np.zeros(self.data_length)
-        self.pos_data2 = np.zeros(self.data_length)
-        self.target_pos_data = np.zeros(self.data_length)
-        self.vel_data1 = np.zeros(self.data_length)
-        self.vel_data2 = np.zeros(self.data_length)
-        self.target_vel_data = np.zeros(self.data_length)
-        self.actual_torque_data = np.zeros(self.data_length)
-        
-        self.current_max_torque_btn = None
+        self.history = {
+            "torque1": np.zeros(self.data_length),
+            "torque2": np.zeros(self.data_length),
+            "actual_torque": np.zeros(self.data_length),
+            "pos1": np.zeros(self.data_length),
+            "pos2": np.zeros(self.data_length),
+            "target_pos": np.zeros(self.data_length),
+            "vel1": np.zeros(self.data_length),
+            "vel2": np.zeros(self.data_length),
+            "target_vel": np.zeros(self.data_length),
+        }
+
+        self.current_preset_button = None
+        self.value_labels = {}
+
+        self.init_ui()
+        self.update_connection_ui()
+        self.refresh_test_estimate()
+
+        self.plot_timer = QTimer(self)
+        self.plot_timer.timeout.connect(self.update_data)
+        self.plot_timer.start(PLOT_INTERVAL_MS)
+
+        self.rx_timer = QTimer(self)
+        self.rx_timer.timeout.connect(self.receive_data)
 
     def init_ui(self):
-        self.setWindowTitle('电机控制系统 v2.0')
-        self.setGeometry(100, 100, 1300, 850)
-        self.setStyleSheet("background-color: #1e1e1e; color: white;")
+        self.setWindowTitle("双电机对拖测试台")
+        self.setGeometry(100, 100, 1360, 860)
+        self.setStyleSheet("""
+            QWidget {
+                background-color: #16181c;
+                color: #eef1f5;
+                font-size: 13px;
+            }
+            QGroupBox {
+                border: 1px solid #323844;
+                border-radius: 6px;
+                margin-top: 12px;
+                padding: 12px 10px 10px 10px;
+                font-weight: 600;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 4px;
+                color: #d9dee7;
+            }
+            QPushButton {
+                background-color: #2d3542;
+                border: 1px solid #3d4655;
+                border-radius: 5px;
+                min-height: 30px;
+                padding: 6px 10px;
+            }
+            QPushButton:hover {
+                background-color: #3a4454;
+            }
+            QPushButton:checked {
+                background-color: #2f6fed;
+                border-color: #75a3ff;
+            }
+            QPushButton:disabled {
+                background-color: #242932;
+                color: #6f7785;
+            }
+            QLabel[role="value"] {
+                color: #dfe7f3;
+                font-family: "Consolas", "Courier New", monospace;
+                font-size: 15px;
+                padding: 4px 0;
+            }
+            QLabel[role="muted"] {
+                color: #98a2b3;
+            }
+            QDoubleSpinBox {
+                background-color: #101318;
+                border: 1px solid #3d4655;
+                border-radius: 4px;
+                min-height: 28px;
+                padding: 2px 6px;
+            }
+            QLineEdit, QPlainTextEdit {
+                background-color: #0d1117;
+                border: 1px solid #303846;
+                border-radius: 4px;
+                color: #dfe7f3;
+                font-family: "Consolas", "Courier New", monospace;
+            }
+            QLineEdit {
+                min-height: 28px;
+                padding: 2px 6px;
+            }
+        """)
 
-        # 主中心部件
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
+
         main_layout = QHBoxLayout(central_widget)
+        main_layout.setContentsMargins(12, 12, 12, 12)
+        main_layout.setSpacing(12)
 
-        # ==========================================
-        # 左侧区域：导航按钮 + 局部切换面板
-        # ==========================================
-        left_container = QWidget()
-        left_container.setFixedWidth(320)
-        left_layout = QVBoxLayout(left_container)
-        left_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.addWidget(self.create_control_panel(), 0)
+        main_layout.addWidget(self.create_plot_panel(), 1)
 
-        # 1. 顶部切换导航栏
+    def create_control_panel(self):
+        panel = QWidget()
+        panel.setFixedWidth(370)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+
         nav_layout = QHBoxLayout()
-        self.btn_nav_basic = QPushButton("基础控制")
-        self.btn_nav_debug = QPushButton("高级调试")
-        
-        for btn in [self.btn_nav_basic, self.btn_nav_debug]:
-            btn.setCheckable(True)
-            btn.setFixedHeight(40)
-            btn.setCursor(Qt.PointingHandCursor)
-            btn.setStyleSheet("""
-                QPushButton { background-color: #333; border: none; font-weight: bold; }
-                QPushButton:checked { background-color: #4CAF50; color: white; }
-                QPushButton:hover:!checked { background-color: #444; }
-            """)
-            nav_layout.addWidget(btn)
-        
-        self.btn_nav_basic.setChecked(True)
-        self.btn_nav_basic.clicked.connect(lambda: self.switch_panel(0))
+        self.btn_nav_overview = self.make_nav_button("运行")
+        self.btn_nav_debug = self.make_nav_button("调试")
+        self.btn_nav_overview.setChecked(True)
+        self.btn_nav_overview.clicked.connect(lambda: self.switch_panel(0))
         self.btn_nav_debug.clicked.connect(lambda: self.switch_panel(1))
-        left_layout.addLayout(nav_layout)
+        nav_layout.addWidget(self.btn_nav_overview)
+        nav_layout.addWidget(self.btn_nav_debug)
+        layout.addLayout(nav_layout)
 
-        # 2. 局部切换的堆栈窗口
         self.control_stack = QStackedWidget()
-        
-        # --- 页面 1: 基础控制面板 ---
-        self.page_basic = QWidget()
-        self.init_basic_page()
-        self.control_stack.addWidget(self.page_basic)
-        
-        # --- 页面 2: 高级调试面板 ---
-        self.page_debug = QWidget()
-        self.init_debug_page()
-        self.control_stack.addWidget(self.page_debug)
+        self.control_stack.addWidget(self.create_overview_page())
+        self.control_stack.addWidget(self.create_debug_page())
+        layout.addWidget(self.control_stack, 1)
+        layout.addWidget(self.create_terminal_group(), 0)
+        return panel
 
-        left_layout.addWidget(self.control_stack)
-        main_layout.addWidget(left_container)
+    def make_nav_button(self, text):
+        button = QPushButton(text)
+        button.setCheckable(True)
+        button.setCursor(Qt.PointingHandCursor)
+        return button
 
-        # ==========================================
-        # 右侧区域：固定不动的图表
-        # ==========================================
-        right_container = QWidget()
-        right_layout = QVBoxLayout(right_container)
-        
-        # 扭矩图
-        self.plot_torque = pg.PlotWidget(title="扭矩反馈 (N·m)")
-        self.curve_torque1 = self.plot_torque.plot(pen='y', name='电机1反馈扭矩')
-        self.curve_torque2 = self.plot_torque.plot(pen='m', name='电机2反馈扭矩')
-        self.curve_actual_torque = self.plot_torque.plot(pen='b', name='计算扭矩')
-        
-        # 位置图
-        self.plot_pos = pg.PlotWidget(title="实时位置 (deg)")
-        self.curve_pos1 = self.plot_pos.plot(pen='g', name='电机1位置')
-        self.curve_pos2 = self.plot_pos.plot(pen='c', name='电机2位置')
-        self.curve_target_pos = self.plot_pos.plot(pen='c', name='目标位置')
-        
-        # 速度图
-        self.plot_vel = pg.PlotWidget(title="实时速度 (deg/s)")
-        self.curve_vel1 = self.plot_vel.plot(pen=pg.mkPen('magenta', width=2), name='电机1速度')
-        self.curve_vel2 = self.plot_vel.plot(pen=pg.mkPen('green', width=2), name='电机2速度')
-        self.curve_target_vel = self.plot_vel.plot(pen=pg.mkPen('cyan', width=1, style=Qt.DashLine), name='目标速度')
+    def create_overview_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
 
-        for p in [self.plot_torque, self.plot_pos, self.plot_vel]:
-            p.showGrid(x=True, y=True)
-            p.addLegend()
-            p.setBackground("#121212")
-            right_layout.addWidget(p)
+        layout.addWidget(self.create_connection_group())
+        layout.addWidget(self.create_realtime_group())
+        layout.addWidget(self.create_stats_group())
+        layout.addStretch()
+        return page
 
-        main_layout.addWidget(right_container, 3)
+    def create_debug_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
 
-    def init_basic_page(self):
-        """构建基础控制页面"""
-        layout = QVBoxLayout(self.page_basic)
-        # 连接控制组
-        conn_group = QGroupBox("系统连接")
-        conn_layout = QVBoxLayout()
-        self.btn_connect = QPushButton("连接电机服务器")
+        layout.addWidget(self.create_preset_group())
+        layout.addWidget(self.create_test_group())
+        layout.addWidget(self.create_command_group())
+        layout.addStretch()
+        return page
+
+    def create_connection_group(self):
+        group = QGroupBox("系统连接")
+        layout = QVBoxLayout(group)
+
+        self.btn_connect = QPushButton("连接服务器")
         self.btn_connect.clicked.connect(self.toggle_connection)
-        self.btn_connect.setStyleSheet("background-color: #4CAF50; padding: 10px; font-weight: bold;")
-        self.lbl_status = QLabel("状态: 未连接")
-        self.lbl_status.setStyleSheet("color: #ff4444;")
-        conn_layout.addWidget(self.btn_connect)
-        conn_layout.addWidget(self.lbl_status)
-        conn_group.setLayout(conn_layout)
-        layout.addWidget(conn_group)
+        self.lbl_status = QLabel()
+        self.lbl_status.setProperty("role", "value")
+        self.lbl_endpoint = QLabel(f"{SERVER_HOST}:{SERVER_PORT}")
+        self.lbl_endpoint.setProperty("role", "muted")
 
-        # 数据面板
-        data_group = QGroupBox("实时数据摘要")
-        data_layout = QVBoxLayout()
-        self.lbl_torque_val = QLabel("当前扭矩: 0.00 Nm")
-        self.lbl_pos_val = QLabel("当前位置: 0.00 deg")
-        self.lbl_vel_val = QLabel("当前速度: 0.00 deg/s")
-        for lbl in [self.lbl_torque_val, self.lbl_pos_val, self.lbl_vel_val]:
-            lbl.setStyleSheet("font-size: 15px; color: #00ff00; padding: 5px;")
-            data_layout.addWidget(lbl)
-        data_group.setLayout(data_layout)
-        layout.addWidget(data_group)
+        layout.addWidget(self.btn_connect)
+        layout.addWidget(self.lbl_status)
+        layout.addWidget(self.lbl_endpoint)
+        return group
 
-        # 物理模型参数
-        model_group = QGroupBox("模型参数设置")
-        model_layout = QVBoxLayout()
-        
-        model_layout.addWidget(QLabel("哑铃重量 (kg):"))
-        self.spin_weight = QDoubleSpinBox()
-        self.spin_weight.setRange(0, 50); self.spin_weight.setValue(self.m_dumbell)
+    def create_realtime_group(self):
+        group = QGroupBox("实时数据")
+        grid = QGridLayout(group)
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(8)
+
+        headers = ("电机", "扭矩", "位置", "速度")
+        for col, text in enumerate(headers):
+            label = QLabel(text)
+            label.setProperty("role", "muted")
+            grid.addWidget(label, 0, col)
+
+        self.add_motor_row(grid, 1, "motor1", "电机 1")
+        self.add_motor_row(grid, 2, "motor2", "电机 2")
+        return group
+
+    def add_motor_row(self, grid, row, key, title):
+        grid.addWidget(QLabel(title), row, 0)
+        for col, metric in enumerate(("torque", "position", "velocity"), start=1):
+            label = QLabel("0.00")
+            label.setProperty("role", "value")
+            self.value_labels[f"{key}_{metric}"] = label
+            grid.addWidget(label, row, col)
+
+    def create_model_group(self):
+        group = QGroupBox("模型参数")
+        layout = QGridLayout(group)
+
+        self.spin_weight = self.make_spinbox(0.0, 50.0, self.load_mass_kg, 0.5, " kg")
+        self.spin_arm = self.make_spinbox(0.1, 1.5, self.arm_length_m, 0.05, " m")
         self.spin_weight.valueChanged.connect(self.update_phys_params)
-        model_layout.addWidget(self.spin_weight)
-
-        model_layout.addWidget(QLabel("力臂长度 (m):"))
-        self.spin_arm = QDoubleSpinBox()
-        self.spin_arm.setRange(0.1, 1.5); self.spin_arm.setValue(self.L)
         self.spin_arm.valueChanged.connect(self.update_phys_params)
-        model_layout.addWidget(self.spin_arm)
-        
-        model_group.setLayout(model_layout)
-        layout.addWidget(model_group)
-        layout.addStretch()
 
-    def init_debug_page(self):
-        """构建高级调试页面"""
-        layout = QVBoxLayout(self.page_debug)
+        layout.addWidget(QLabel("负载质量"), 0, 0)
+        layout.addWidget(self.spin_weight, 0, 1)
+        layout.addWidget(QLabel("力臂长度"), 1, 0)
+        layout.addWidget(self.spin_arm, 1, 1)
+        return group
 
-        #数据面板
-        debug_data_group = QGroupBox("实时数据")
-        debug_data_layout = QVBoxLayout()
-        self.lbl_debug_torque_val1 = QLabel("电机 1 当前扭矩: 0.00 Nm")
-        self.lbl_debug_pos_val1 = QLabel("电机 1 当前位置: 0.00 deg")
-        self.lbl_debug_vel_val1 = QLabel("电机 1 当前速度: 0.00 deg/s")
-        self.lbl_debug_torque_val2 = QLabel("电机 2 当前扭矩: 0.00 Nm")
-        self.lbl_debug_pos_val2 = QLabel("电机 2 当前位置: 0.00 deg")
-        self.lbl_debug_vel_val2 = QLabel("电机 2 当前速度: 0.00 deg/s")
-        for lbl in [self.lbl_debug_torque_val1, self.lbl_debug_pos_val1, self.lbl_debug_vel_val1, 
-                    self.lbl_debug_torque_val2, self.lbl_debug_pos_val2, self.lbl_debug_vel_val2]:
-            lbl.setStyleSheet("font-size: 15px; color: #ffffff; padding: 5px;")
-            debug_data_layout.addWidget(lbl)
-        debug_data_group.setLayout(debug_data_layout)
-        layout.addWidget(debug_data_group)
-        
-        # 选型设置
-        motor_group = QGroupBox("电机型号/Max Torque")
-        motor_layout = QGridLayout()
-        mt_configs = [
-            ("50标准 (40Nm)", 40.0), ("50加长 (40Nm)", 40.0),
-            ("70标准 (80Nm)", 80.0), ("85标准 (160Nm)", 160.0)
-        ]
-        self.mt_btns = []
-        for i, (name, val) in enumerate(mt_configs):
-            btn = QPushButton(name)
-            btn.clicked.connect(lambda chk, v=val, b=btn: self.set_max_torque(v, b))
-            btn.setStyleSheet("background-color: #2196F3; padding: 5px; font-size: 11px;")
-            motor_layout.addWidget(btn, i//2, i%2)
-            self.mt_btns.append(btn)
-        motor_group.setLayout(motor_layout)
-        layout.addWidget(motor_group)
+    def create_stats_group(self):
+        group = QGroupBox("统计")
+        layout = QGridLayout(group)
 
-        # 自动化测试
-        test_group = QGroupBox("自动化控制")
-        test_layout = QVBoxLayout()
-        
-        self.btn_zero = QPushButton("绝对位置置零")
-        self.btn_zero.clicked.connect(self.set_zero_position)
-        self.btn_zero.setStyleSheet("background-color: #FF9800; padding: 8px;")
-        
-        self.btn_test = QPushButton("启动一键测试流程")
-        self.btn_test.clicked.connect(self.run_test)
-        self.btn_test.setStyleSheet("background-color: #E91E63; padding: 12px; font-weight: bold;")
-        
-        self.btn_disable = QPushButton("紧急失能电机")
-        self.btn_disable.clicked.connect(self.motor_disable)
-        self.btn_disable.setStyleSheet("background-color: #b71c1c; padding: 8px;")
-
-        test_layout.addWidget(self.btn_zero)
-        test_layout.addWidget(self.btn_test)
-        test_layout.addWidget(self.btn_disable)
-        test_group.setLayout(test_layout)
-        layout.addWidget(test_group)
-
-        # 统计数据
-        stat_group = QGroupBox("统计数据")
-        stat_layout = QVBoxLayout()
-        self.lbl_peak_torque = QLabel("峰值扭矩: 0.00 Nm")
+        self.lbl_peak_torque = QLabel("0.00 Nm")
+        self.lbl_peak_torque.setProperty("role", "value")
+        self.lbl_actual_torque = QLabel("0.00 Nm")
+        self.lbl_actual_torque.setProperty("role", "value")
         self.btn_clear_peak = QPushButton("清除峰值")
-        self.btn_clear_peak.clicked.connect(self.reset_max_torque)
-        stat_layout.addWidget(self.lbl_peak_torque)
-        stat_layout.addWidget(self.btn_clear_peak)
-        stat_group.setLayout(stat_layout)
-        layout.addWidget(stat_group)
+        self.btn_clear_peak.clicked.connect(self.reset_peak_torque)
 
-        layout.addStretch()
+        layout.addWidget(QLabel("反馈峰值"), 0, 0)
+        layout.addWidget(self.lbl_peak_torque, 0, 1)
+        layout.addWidget(QLabel("模型扭矩"), 1, 0)
+        layout.addWidget(self.lbl_actual_torque, 1, 1)
+        layout.addWidget(self.btn_clear_peak, 2, 0, 1, 2)
+        return group
 
-    # ==========================================
-    # 逻辑处理函数
-    # ==========================================
+    def create_preset_group(self):
+        group = QGroupBox("电机选型")
+        grid = QGridLayout(group)
+        self.preset_buttons = []
+
+        for index, (name, max_torque, mass, arm) in enumerate(MOTOR_PRESETS):
+            button = QPushButton(f"{name}\n{max_torque:.0f} Nm")
+            button.setCheckable(True)
+            button.clicked.connect(
+                lambda _, b=button, p=(max_torque, mass, arm): self.apply_motor_preset(b, p)
+            )
+            grid.addWidget(button, index // 2, index % 2)
+            self.preset_buttons.append(button)
+
+        return group
+
+    def create_test_group(self):
+        group = QGroupBox("对拖测试")
+        layout = QGridLayout(group)
+
+        self.spin_test_pos = self.make_spinbox(-360.0, 360.0, DEFAULT_TEST_POS_DEG, 10.0, " deg")
+        self.spin_test_vel = self.make_spinbox(1.0, 180.0, DEFAULT_TEST_VEL_DEG_S, 1.0, " deg/s")
+        self.spin_drag_load = self.make_spinbox(0.0, 40.0, DEFAULT_LOAD_TORQUE_NM, 0.5, " Nm")
+        self.lbl_test_estimate = QLabel()
+        self.lbl_test_estimate.setProperty("role", "muted")
+
+        for spin in (self.spin_test_pos, self.spin_test_vel, self.spin_drag_load):
+            spin.valueChanged.connect(self.refresh_test_estimate)
+
+        layout.addWidget(QLabel("相对角度"), 0, 0)
+        layout.addWidget(self.spin_test_pos, 0, 1)
+        layout.addWidget(QLabel("目标速度"), 1, 0)
+        layout.addWidget(self.spin_test_vel, 1, 1)
+        layout.addWidget(QLabel("负载扭矩"), 2, 0)
+        layout.addWidget(self.spin_drag_load, 2, 1)
+        layout.addWidget(self.lbl_test_estimate, 3, 0, 1, 2)
+
+        self.btn_test = QPushButton("启动往返测试")
+        self.btn_test.clicked.connect(self.run_test)
+        layout.addWidget(self.btn_test, 4, 0, 1, 2)
+        return group
+
+    def create_command_group(self):
+        group = QGroupBox("手动命令")
+        layout = QGridLayout(group)
+
+        self.btn_zero = QPushButton("置零")
+        self.btn_zero.clicked.connect(self.set_zero_position)
+        self.btn_disable = QPushButton("失能")
+        self.btn_disable.clicked.connect(self.motor_disable)
+        self.btn_forward = QPushButton("正向")
+        self.btn_forward.clicked.connect(lambda: self.move_once(1.0))
+        self.btn_reverse = QPushButton("反向")
+        self.btn_reverse.clicked.connect(lambda: self.move_once(-1.0))
+
+        layout.addWidget(self.btn_zero, 0, 0)
+        layout.addWidget(self.btn_disable, 0, 1)
+        layout.addWidget(self.btn_forward, 1, 0)
+        layout.addWidget(self.btn_reverse, 1, 1)
+        return group
+
+    def create_terminal_group(self):
+        group = QGroupBox("通信终端")
+        layout = QVBoxLayout(group)
+
+        self.terminal_output = QPlainTextEdit()
+        self.terminal_output.setReadOnly(True)
+        self.terminal_output.setMinimumHeight(180)
+        self.terminal_output.document().setMaximumBlockCount(TERMINAL_MAX_BLOCKS)
+
+        input_layout = QHBoxLayout()
+        self.terminal_input = QLineEdit()
+        self.terminal_input.setPlaceholderText("输入命令后回车，例如: ZERO")
+        self.terminal_input.returnPressed.connect(self.send_terminal_command)
+        self.btn_terminal_send = QPushButton("发送")
+        self.btn_terminal_send.clicked.connect(self.send_terminal_command)
+        self.btn_terminal_clear = QPushButton("清空")
+        self.btn_terminal_clear.clicked.connect(self.terminal_output.clear)
+
+        input_layout.addWidget(self.terminal_input, 1)
+        input_layout.addWidget(self.btn_terminal_send)
+        input_layout.addWidget(self.btn_terminal_clear)
+
+        layout.addWidget(self.terminal_output)
+        layout.addLayout(input_layout)
+        return group
+
+    def make_spinbox(self, minimum, maximum, value, step, suffix=""):
+        spinbox = QDoubleSpinBox()
+        spinbox.setRange(minimum, maximum)
+        spinbox.setDecimals(2)
+        spinbox.setSingleStep(step)
+        spinbox.setValue(value)
+        spinbox.setSuffix(suffix)
+        return spinbox
+
+    def create_plot_panel(self):
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+
+        self.plot_torque = self.make_plot("扭矩反馈", "N·m")
+        self.curve_torque1 = self.plot_torque.plot(pen=pg.mkPen("#f5c542", width=2), name="电机 1")
+        self.curve_torque2 = self.plot_torque.plot(pen=pg.mkPen("#9b7bff", width=2), name="电机 2")
+        self.curve_actual_torque = self.plot_torque.plot(
+            pen=pg.mkPen("#4fc3f7", width=1, style=Qt.DashLine),
+            name="模型",
+        )
+
+        self.plot_pos = self.make_plot("位置", "deg")
+        self.curve_pos1 = self.plot_pos.plot(pen=pg.mkPen("#52d273", width=2), name="电机 1")
+        self.curve_pos2 = self.plot_pos.plot(pen=pg.mkPen("#48c6d9", width=2), name="电机 2")
+        self.curve_target_pos = self.plot_pos.plot(
+            pen=pg.mkPen("#f58f42", width=1, style=Qt.DashLine),
+            name="目标",
+        )
+
+        self.plot_vel = self.make_plot("速度", "deg/s")
+        self.curve_vel1 = self.plot_vel.plot(pen=pg.mkPen("#ff6b9a", width=2), name="电机 1")
+        self.curve_vel2 = self.plot_vel.plot(pen=pg.mkPen("#75d377", width=2), name="电机 2")
+        self.curve_target_vel = self.plot_vel.plot(
+            pen=pg.mkPen("#57b8ff", width=1, style=Qt.DashLine),
+            name="目标",
+        )
+
+        for plot in (self.plot_torque, self.plot_pos, self.plot_vel):
+            layout.addWidget(plot)
+
+        return panel
+
+    def make_plot(self, title, unit):
+        plot = pg.PlotWidget(title=f"{title} ({unit})")
+        plot.showGrid(x=True, y=True, alpha=0.25)
+        plot.addLegend(offset=(10, 10))
+        plot.setBackground("#101318")
+        plot.setLabel("bottom", "时间", units="s")
+        return plot
+
     def switch_panel(self, index):
         self.control_stack.setCurrentIndex(index)
-        self.btn_nav_basic.setChecked(index == 0)
+        self.btn_nav_overview.setChecked(index == 0)
         self.btn_nav_debug.setChecked(index == 1)
 
     def toggle_connection(self):
-        if not self.is_connected:
-            try:
-                self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                self.sock.settimeout(2)
-                self.sock.connect(('127.0.0.1', 9999))
-                self.is_connected = True
-                self.btn_connect.setText("断开连接")
-                self.btn_connect.setStyleSheet("background-color: #f44336; padding: 10px;")
-                self.lbl_status.setText("状态: 已连接")
-                self.lbl_status.setStyleSheet("color: #4CAF50;")
-                self.rx_timer.start(20)
-            except Exception as e:
-                self.lbl_status.setText(f"错误: {str(e)[:20]}...")
-        else:
+        if self.is_connected:
             self.disconnect_all()
+            return
+
+        try:
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.sock.settimeout(2)
+            self.sock.connect((SERVER_HOST, SERVER_PORT))
+            self.sock.setblocking(False)
+            self.is_connected = True
+            self.rx_timer.start(RX_INTERVAL_MS)
+            self.append_terminal(f"! 已连接 {SERVER_HOST}:{SERVER_PORT}")
+        except OSError as exc:
+            self.disconnect_all()
+            self.append_terminal(f"! 连接失败: {exc}")
+            self.lbl_status.setText(f"连接失败: {str(exc)[:28]}")
+        finally:
+            self.update_connection_ui()
 
     def disconnect_all(self):
         self.is_connected = False
-        if self.sock:
-            self.sock.close()
-            self.sock = None
-        self.btn_connect.setText("连接电机服务器")
-        self.btn_connect.setStyleSheet("background-color: #4CAF50; padding: 10px;")
-        self.lbl_status.setText("状态: 未连接")
-        self.lbl_status.setStyleSheet("color: #ff4444;")
+        self.rx_buffer = ""
+        self.test_token += 1
         self.rx_timer.stop()
 
-    def receive_data(self):
-        if not self.is_connected: return
+        if self.sock:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+            self.sock = None
+
+        self.update_connection_ui()
+
+    def update_connection_ui(self):
+        connected = self.is_connected and self.sock is not None
+        self.lbl_status.setText("状态: 已连接" if connected else "状态: 未连接")
+        self.lbl_status.setStyleSheet("color: #58d68d;" if connected else "color: #ff6b6b;")
+        self.btn_connect.setText("断开连接" if connected else "连接服务器")
+        self.btn_connect.setStyleSheet(
+            "background-color: #9b2f35; border-color: #d96b72;"
+            if connected
+            else "background-color: #266f43; border-color: #58d68d;"
+        )
+
+        for button in (
+            self.btn_test,
+            self.btn_zero,
+            self.btn_disable,
+            self.btn_forward,
+            self.btn_reverse,
+            self.btn_clear_peak,
+            self.btn_terminal_send,
+        ):
+            button.setEnabled(connected)
+        for button in getattr(self, "preset_buttons", []):
+            button.setEnabled(connected)
+        self.terminal_input.setEnabled(connected)
+
+    def append_terminal(self, message):
+        if not hasattr(self, "terminal_output"):
+            return
+        self.terminal_output.appendPlainText(message)
+        scroll_bar = self.terminal_output.verticalScrollBar()
+        scroll_bar.setValue(scroll_bar.maximum())
+
+    def format_command_for_log(self, command):
+        if isinstance(command, bytes):
+            text = command.decode("utf-8", errors="ignore")
+        else:
+            text = str(command)
+        return text.rstrip("\r\n")
+
+    def send_terminal_command(self):
+        command = self.terminal_input.text().strip()
+        if not command:
+            return
+        self.terminal_input.clear()
+        if not self.is_connected:
+            self.append_terminal("! 未连接，命令未发送")
+            return
+        self.send_command(f"{command}\n")
+
+    def send_command(self, command, log_command=True):
+        if not self.is_connected or not self.sock:
+            return False
+
         try:
-            self.sock.setblocking(False)
-            data = self.sock.recv(1024).decode('utf-8')
-            for line in data.split('\n'):
-                if line.startswith("TORQUE1"):
-                    self.current_torque_val1 = float(line.split()[1])
-                    if abs(self.current_torque_val1) > self.max_torque:
-                        self.max_torque = abs(self.current_torque_val1)
-                elif line.startswith("POS1"):
-                    self.current_pos_val1 = float(line.split()[1])
-                elif line.startswith("VEL1"):
-                    self.current_vel_val1 = float(line.split()[1])
-                elif line.startswith("POS_WITH_VEL_COMPLETE"):
-                    self.target_vel = 0.0
-                elif line.startswith("TORQUE2"):
-                    self.current_torque_val2 = float(line.split()[1])
-                elif line.startswith("POS2"):
-                    self.current_pos_val2 = float(line.split()[1])
-                elif line.startswith("VEL2"):
-                    self.current_vel_val2 = float(line.split()[1])
-        except: pass
+            data = command.encode("utf-8") if isinstance(command, str) else command
+            if log_command:
+                self.append_terminal(f"> {self.format_command_for_log(command)}")
+            self.sock.sendall(data)
+            return True
+        except (BrokenPipeError, ConnectionResetError, OSError) as exc:
+            message = f"发送失败: {exc}"
+            print(message)
+            self.append_terminal(f"! {message}")
+            self.disconnect_all()
+            return False
+
+    def receive_data(self):
+        if not self.is_connected or not self.sock:
+            return
+
+        try:
+            while True:
+                data = self.sock.recv(4096)
+                if not data:
+                    message = "服务器已断开连接"
+                    print(message)
+                    self.append_terminal(f"! {message}")
+                    self.disconnect_all()
+                    return
+                self.rx_buffer += data.decode("utf-8", errors="ignore")
+                lines = self.rx_buffer.split("\n")
+                self.rx_buffer = lines.pop()
+                self.parse_telemetry(lines)
+        except BlockingIOError:
+            return
+        except (ConnectionResetError, BrokenPipeError, OSError) as exc:
+            message = f"接收失败: {exc}"
+            print(message)
+            self.append_terminal(f"! {message}")
+            self.disconnect_all()
+        except (UnicodeDecodeError, ValueError, IndexError):
+            return
+
+    def parse_telemetry(self, lines):
+        for raw_line in lines:
+            parts = raw_line.split()
+            if not parts:
+                continue
+            key = parts[0].strip()
+            if key == "POS_WITH_VEL_COMPLETE":
+                self.target_vel = 0.0
+                self.append_terminal("< POS_WITH_VEL_COMPLETE")
+                continue
+            if key == "LOG":
+                self.append_terminal(f"< {raw_line[4:]}")
+                continue
+            if key not in TELEMETRY_KEYS:
+                self.append_terminal(f"< {raw_line}")
+                continue
+            if len(parts) < 2:
+                continue
+
+            value = float(parts[1])
+            if key == "TORQUE1":
+                self.motor_1.torque = value
+            elif key == "POS1":
+                self.motor_1.position = value
+            elif key == "VEL1":
+                self.motor_1.velocity = value
+            elif key == "TORQUE2":
+                self.motor_2.torque = value
+            elif key == "POS2":
+                self.motor_2.position = value
+            elif key == "VEL2":
+                self.motor_2.velocity = value
+
+        self.peak_torque = max(
+            self.peak_torque,
+            abs(self.motor_1.torque),
+            abs(self.motor_2.torque),
+        )
 
     def update_data(self):
-        if not self.is_connected: return
-        
-        # 计算速度
-        # dt = 0.1
-        # self.current_vel_val = abs((self.current_pos_val1 - self.last_pos_val) / dt)
-        # self.last_pos_val = self.current_pos_val1
+        self.update_actual_torque()
+        self.push_history()
+        self.update_labels()
+        self.update_plots()
 
-        # 物理计算
-        theta_rad = self.current_pos_val1 * np.pi / 180
-        self.actual_torque_val = (self.m_dumbell * self.L + self.m_arm * 0.25) * self.g * np.sin(theta_rad)
+    def update_actual_torque(self):
+        theta_rad = np.deg2rad(self.motor_1.position)
+        self.actual_torque = (
+            self.load_mass_kg * self.arm_length_m + self.arm_mass_kg * 0.25
+        ) * self.gravity * np.sin(theta_rad)
 
-        # 更新缓冲区
-        self.torque_data1 = np.roll(self.torque_data1, -1); self.torque_data1[-1] = self.current_torque_val1
-        self.torque_data2 = np.roll(self.torque_data2, -1); self.torque_data2[-1] = self.current_torque_val2
-        self.pos_data1 = np.roll(self.pos_data1, -1); self.pos_data1[-1] = self.current_pos_val1
-        self.pos_data2 = np.roll(self.pos_data2, -1); self.pos_data2[-1] = self.current_pos_val2
-        self.target_pos_data = np.roll(self.target_pos_data, -1); self.target_pos_data[-1] = self.target_pos
-        self.vel_data1 = np.roll(self.vel_data1, -1); self.vel_data1[-1] = self.current_vel_val1
-        self.vel_data2 = np.roll(self.vel_data2, -1); self.vel_data2[-1] = self.current_vel_val2
-        self.target_vel_data = np.roll(self.target_vel_data, -1); self.target_vel_data[-1] = self.target_vel
-        self.actual_torque_data = np.roll(self.actual_torque_data, -1); self.actual_torque_data[-1] = self.actual_torque_val
+    def push_history(self):
+        values = {
+            "torque1": self.motor_1.torque,
+            "torque2": self.motor_2.torque,
+            "actual_torque": self.actual_torque,
+            "pos1": self.motor_1.position,
+            "pos2": self.motor_2.position,
+            "target_pos": self.target_pos,
+            "vel1": self.motor_1.velocity,
+            "vel2": self.motor_2.velocity,
+            "target_vel": self.target_vel,
+        }
+        for key, value in values.items():
+            self.history[key] = np.roll(self.history[key], -1)
+            self.history[key][-1] = value
 
-        # 刷新 UI 标签
-        self.lbl_torque_val.setText(f"当前扭矩: {self.current_torque_val1:.2f} Nm")
-        self.lbl_pos_val.setText(f"当前位置: {self.current_pos_val1:.2f} deg")
-        self.lbl_vel_val.setText(f"当前速度: {self.current_vel_val1:.2f} deg/s")
-        self.lbl_debug_torque_val1.setText(f"电机 1 当前扭矩: {self.current_torque_val1:.2f} Nm")
-        self.lbl_debug_pos_val1.setText(f"电机 1 当前位置: {self.current_pos_val1:.2f} deg")
-        self.lbl_debug_vel_val1.setText(f"电机 1 当前速度: {self.current_vel_val1:.2f} deg/s")
-        self.lbl_debug_torque_val2.setText(f"电机 2 当前扭矩: {self.current_torque_val2:.2f} Nm")
-        self.lbl_debug_pos_val2.setText(f"电机 2 当前位置: {self.current_pos_val2:.2f} deg")
-        self.lbl_debug_vel_val2.setText(f"电机 2 当前速度: {self.current_vel_val2:.2f} deg/s")
-        self.lbl_peak_torque.setText(f"峰值扭矩: {self.max_torque:.2f} Nm")
+    def update_labels(self):
+        self.value_labels["motor1_torque"].setText(f"{self.motor_1.torque:.2f} Nm")
+        self.value_labels["motor1_position"].setText(f"{self.motor_1.position:.2f} deg")
+        self.value_labels["motor1_velocity"].setText(f"{self.motor_1.velocity:.2f} deg/s")
+        self.value_labels["motor2_torque"].setText(f"{self.motor_2.torque:.2f} Nm")
+        self.value_labels["motor2_position"].setText(f"{self.motor_2.position:.2f} deg")
+        self.value_labels["motor2_velocity"].setText(f"{self.motor_2.velocity:.2f} deg/s")
+        self.lbl_peak_torque.setText(f"{self.peak_torque:.2f} Nm")
+        self.lbl_actual_torque.setText(f"{self.actual_torque:.2f} Nm")
 
-        # 刷新图表
-        self.curve_torque1.setData(self.time_axis, self.torque_data1)
-        self.curve_torque2.setData(self.time_axis, self.torque_data2)
-        self.curve_actual_torque.setData(self.time_axis, self.actual_torque_data)
-        self.curve_pos1.setData(self.time_axis, self.pos_data1)
-        self.curve_pos2.setData(self.time_axis, self.pos_data2)
-        self.curve_target_pos.setData(self.time_axis, self.target_pos_data)
-        self.curve_vel1.setData(self.time_axis, self.vel_data1)
-        self.curve_vel2.setData(self.time_axis, self.vel_data2)
-        self.curve_target_vel.setData(self.time_axis, self.target_vel_data)
+    def update_plots(self):
+        self.curve_torque1.setData(self.time_axis, self.history["torque1"])
+        self.curve_torque2.setData(self.time_axis, self.history["torque2"])
+        self.curve_actual_torque.setData(self.time_axis, self.history["actual_torque"])
+        self.curve_pos1.setData(self.time_axis, self.history["pos1"])
+        self.curve_pos2.setData(self.time_axis, self.history["pos2"])
+        self.curve_target_pos.setData(self.time_axis, self.history["target_pos"])
+        self.curve_vel1.setData(self.time_axis, self.history["vel1"])
+        self.curve_vel2.setData(self.time_axis, self.history["vel2"])
+        self.curve_target_vel.setData(self.time_axis, self.history["target_vel"])
 
-    def set_max_torque(self, value, btn):
-        if not self.is_connected: return
-        if self.current_max_torque_btn:
-            self.current_max_torque_btn.setStyleSheet("background-color: #2196F3; padding: 5px;")
-        btn.setStyleSheet("background-color: #0D47A1; border: 2px solid gold; padding: 5px;")
-        self.current_max_torque_btn = btn
-        
-        try:
-            self.sock.sendall(f"SET_MAX_TORQUE {value}\n".encode())
-            # 自动调整物理模型参数
-            if "50" in btn.text(): self.m_dumbell, self.L = 5.0, 0.45
-            elif "70" in btn.text(): self.m_dumbell, self.L = 10.0, 0.35
-            elif "85" in btn.text(): self.m_dumbell, self.L = 25.0, 0.50
-            self.spin_weight.setValue(self.m_dumbell)
-            self.spin_arm.setValue(self.L)
-        except: self.disconnect_all()
+    def apply_motor_preset(self, button, preset):
+        max_torque, mass, arm = preset
+        if self.current_preset_button:
+            self.current_preset_button.setChecked(False)
+        button.setChecked(True)
+        self.current_preset_button = button
+
+        if not self.send_command(f"SET_MAX_TORQUE {max_torque}\n"):
+            return
+
+        self.load_mass_kg = mass
+        self.arm_length_m = arm
+        if hasattr(self, "spin_weight"):
+            self.spin_weight.setValue(mass)
+        if hasattr(self, "spin_arm"):
+            self.spin_arm.setValue(arm)
+
+    def refresh_test_estimate(self):
+        if not hasattr(self, "spin_test_pos"):
+            return
+        duration = self.single_move_duration_ms() / 1000.0
+        self.lbl_test_estimate.setText(f"单程约 {duration:.1f} s，往返约 {duration * 2.0:.1f} s")
+
+    def single_move_duration_ms(self):
+        velocity = max(abs(self.spin_test_vel.value()), 0.001)
+        distance = abs(self.spin_test_pos.value())
+        return int(distance / velocity * 1000)
 
     def run_test(self):
-        if not self.is_connected: return
-        try:
-            self.sock.sendall(b"ZERO\n")
-            self.target_pos = 0.0
-            QTimer.singleShot(500, lambda: self.send_cmd(360.0, 0.0, 36.0))
-            QTimer.singleShot(13000, lambda: self.send_cmd(-360.0, 0.0, 36.0))
-        except: pass
+        if not self.is_connected:
+            return
 
-    def send_cmd(self, p, t, v):
-        if self.sock:
-            self.sock.sendall(f"POS_WITH_VEL {p} {t} {v}\n".encode())
-            self.target_pos += p
-            self.target_vel = v
+        self.test_token += 1
+        token = self.test_token
+        move_ms = self.single_move_duration_ms()
+        settle_ms = 500
+        zero_delay_ms = 300
+
+        self.reset_peak_torque()
+        if not self.motor_disable():
+            return
+        if not self.set_zero_position():
+            return
+
+        QTimer.singleShot(zero_delay_ms, lambda: self.start_test_move(token, 1.0))
+        QTimer.singleShot(
+            zero_delay_ms + move_ms + settle_ms,
+            lambda: self.run_if_current(token, lambda: self.move_once(-1.0)),
+        )
+        QTimer.singleShot(
+            zero_delay_ms + move_ms * 2 + settle_ms * 2,
+            lambda: self.run_if_current(token, self.motor_disable),
+        )
+
+    def start_test_move(self, token, direction):
+        if token != self.test_token or not self.is_connected:
+            return
+        if abs(self.motor_1.position) > ZERO_GUARD_DEG:
+            print("电机位置未置零，测试中止")
+            self.motor_disable()
+            return
+        self.move_once(direction)
+
+    def run_if_current(self, token, callback):
+        if token == self.test_token and self.is_connected:
+            callback()
+
+    def move_once(self, direction):
+        pos = abs(self.spin_test_pos.value()) * direction
+        velocity = self.spin_test_vel.value()
+        load_torque = self.spin_drag_load.value()
+        return self.position_with_velocity(pos, velocity, load_torque)
+
+    def position_with_velocity(self, pos, velocity, torque=0.0):
+        if self.send_command(f"POS_WITH_VEL {pos:.2f} {torque:.2f} {velocity:.2f}\n"):
+            self.target_pos += pos
+            self.target_vel = abs(velocity) if pos >= 0.0 else -abs(velocity)
+            print(f"Sent drag command: pos={pos:.2f}, torque={torque:.2f}, velocity={velocity:.2f}")
+            return True
+        return False
 
     def motor_disable(self):
-        if self.sock: self.sock.sendall(b"DISABLE_MOTOR\n")
+        self.target_vel = 0.0
+        return self.send_command(b"DISABLE_MOTOR\n")
+
     def set_zero_position(self):
-        if self.sock: self.sock.sendall(b"ZERO\n"); self.target_pos = 0.0
-    def reset_max_torque(self): self.max_torque = 0.0
+        if self.send_command(b"ZERO\n"):
+            self.target_pos = 0.0
+            return True
+        return False
+
+    def reset_peak_torque(self):
+        self.peak_torque = 0.0
+        self.lbl_peak_torque.setText("0.00 Nm")
+
     def update_phys_params(self):
-        self.m_dumbell = self.spin_weight.value()
-        self.L = self.spin_arm.value()
+        if hasattr(self, "spin_weight"):
+            self.load_mass_kg = self.spin_weight.value()
+        if hasattr(self, "spin_arm"):
+            self.arm_length_m = self.spin_arm.value()
 
     def closeEvent(self, event):
         self.disconnect_all()
         event.accept()
 
+
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    app.setFont(QFont('Segoe UI', 9))
+    app.setFont(QFont("Segoe UI", 9))
     window = MotorControlApp()
     window.show()
     sys.exit(app.exec_())

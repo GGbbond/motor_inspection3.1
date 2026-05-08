@@ -1,11 +1,17 @@
+import errno
+import fcntl
+import os
+import pty
+import signal
 import socket
 import sys
+import time
 from dataclasses import dataclass
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtGui import QFont
+from PyQt5.QtCore import QSocketNotifier, Qt, QTimer
+from PyQt5.QtGui import QFont, QTextCursor
 from PyQt5.QtWidgets import (
     QApplication,
     QDoubleSpinBox,
@@ -25,6 +31,9 @@ from PyQt5.QtWidgets import (
 
 SERVER_HOST = "127.0.0.1"
 SERVER_PORT = 9999
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BACKEND_WORKDIR = os.path.join(BASE_DIR, "build")
+BACKEND_EXECUTABLE = os.path.join(BACKEND_WORKDIR, "bin", "motor_test")
 PLOT_INTERVAL_MS = 100
 RX_INTERVAL_MS = 20
 DEFAULT_TEST_POS_DEG = 360.0
@@ -32,6 +41,7 @@ DEFAULT_TEST_VEL_DEG_S = 36.0
 DEFAULT_LOAD_TORQUE_NM = 2.0
 ZERO_GUARD_DEG = 1.0
 TERMINAL_MAX_BLOCKS = 500
+CAN_LOG_JOIN_WINDOW_SEC = 3.0
 TELEMETRY_KEYS = {"TORQUE1", "POS1", "VEL1", "TORQUE2", "POS2", "VEL2"}
 
 MOTOR_PRESETS = (
@@ -55,8 +65,14 @@ class MotorControlApp(QMainWindow):
 
         self.sock = None
         self.is_connected = False
-        self.rx_buffer = ""
+        self.rx_buffer = b""
         self.test_token = 0
+        self.last_can_log_id = None
+        self.last_can_log_time = 0.0
+        self.last_can_log_open = False
+        self.backend_pid = None
+        self.backend_fd = None
+        self.backend_notifier = None
 
         self.motor_1 = MotorSample()
         self.motor_2 = MotorSample()
@@ -366,27 +382,41 @@ class MotorControlApp(QMainWindow):
         return group
 
     def create_terminal_group(self):
-        group = QGroupBox("通信终端")
+        group = QGroupBox("后端终端")
         layout = QVBoxLayout(group)
+
+        backend_layout = QHBoxLayout()
+        self.btn_backend_start = QPushButton("启动后端")
+        self.btn_backend_start.clicked.connect(self.start_backend_terminal)
+        self.btn_backend_stop = QPushButton("停止后端")
+        self.btn_backend_stop.clicked.connect(self.stop_backend_terminal)
+        self.lbl_backend_status = QLabel("后端: 未启动")
+        self.lbl_backend_status.setProperty("role", "muted")
+
+        backend_layout.addWidget(self.btn_backend_start)
+        backend_layout.addWidget(self.btn_backend_stop)
+        backend_layout.addWidget(self.lbl_backend_status, 1)
 
         self.terminal_output = QPlainTextEdit()
         self.terminal_output.setReadOnly(True)
         self.terminal_output.setMinimumHeight(180)
+        self.terminal_output.setLineWrapMode(QPlainTextEdit.WidgetWidth)
         self.terminal_output.document().setMaximumBlockCount(TERMINAL_MAX_BLOCKS)
 
         input_layout = QHBoxLayout()
         self.terminal_input = QLineEdit()
-        self.terminal_input.setPlaceholderText("输入命令后回车，例如: ZERO")
+        self.terminal_input.setPlaceholderText("输入后端命令后回车，例如: p_info")
         self.terminal_input.returnPressed.connect(self.send_terminal_command)
-        self.btn_terminal_send = QPushButton("发送")
+        self.btn_terminal_send = QPushButton("回车")
         self.btn_terminal_send.clicked.connect(self.send_terminal_command)
         self.btn_terminal_clear = QPushButton("清空")
-        self.btn_terminal_clear.clicked.connect(self.terminal_output.clear)
+        self.btn_terminal_clear.clicked.connect(self.clear_terminal)
 
         input_layout.addWidget(self.terminal_input, 1)
         input_layout.addWidget(self.btn_terminal_send)
         input_layout.addWidget(self.btn_terminal_clear)
 
+        layout.addLayout(backend_layout)
         layout.addWidget(self.terminal_output)
         layout.addLayout(input_layout)
         return group
@@ -453,6 +483,12 @@ class MotorControlApp(QMainWindow):
             self.disconnect_all()
             return
 
+        self.connect_server()
+
+    def connect_server(self):
+        if self.is_connected:
+            return
+
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.sock.settimeout(2)
@@ -470,7 +506,7 @@ class MotorControlApp(QMainWindow):
 
     def disconnect_all(self):
         self.is_connected = False
-        self.rx_buffer = ""
+        self.rx_buffer = b""
         self.test_token += 1
         self.rx_timer.stop()
 
@@ -482,6 +518,152 @@ class MotorControlApp(QMainWindow):
             self.sock = None
 
         self.update_connection_ui()
+
+    def backend_running(self):
+        if self.backend_pid is None:
+            return False
+
+        try:
+            pid, _ = os.waitpid(self.backend_pid, os.WNOHANG)
+        except ChildProcessError:
+            self.finish_backend_terminal()
+            return False
+
+        if pid == 0:
+            return True
+
+        self.finish_backend_terminal()
+        return False
+
+    def start_backend_terminal(self):
+        if self.backend_running():
+            self.append_terminal("! 后端已经在运行")
+            return
+
+        if not os.path.exists(BACKEND_EXECUTABLE):
+            self.append_terminal(f"! 未找到后端程序: {BACKEND_EXECUTABLE}")
+            return
+        if not os.access(BACKEND_EXECUTABLE, os.X_OK):
+            self.append_terminal(f"! 后端程序没有执行权限: {BACKEND_EXECUTABLE}")
+            return
+
+        try:
+            pid, fd = pty.fork()
+        except OSError as exc:
+            self.append_terminal(f"! 启动后端失败: {exc}")
+            return
+
+        if pid == 0:
+            try:
+                os.chdir(BACKEND_WORKDIR)
+                os.execv(BACKEND_EXECUTABLE, [BACKEND_EXECUTABLE])
+            except OSError as exc:
+                os.write(2, f"exec motor_test failed: {exc}\n".encode("utf-8"))
+                os._exit(127)
+
+        flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+        fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+
+        self.backend_pid = pid
+        self.backend_fd = fd
+        self.backend_notifier = QSocketNotifier(fd, QSocketNotifier.Read, self)
+        self.backend_notifier.activated.connect(self.read_backend_terminal)
+        self.append_terminal(f"! 后端已启动: {BACKEND_EXECUTABLE}")
+        self.update_backend_ui()
+
+    def stop_backend_terminal(self):
+        if not self.backend_running():
+            self.finish_backend_terminal()
+            return
+
+        try:
+            os.kill(self.backend_pid, signal.SIGTERM)
+        except OSError:
+            pass
+
+        QTimer.singleShot(300, self.force_stop_backend_terminal)
+        if self.is_connected:
+            self.disconnect_all()
+
+    def force_stop_backend_terminal(self):
+        if self.backend_pid is None:
+            return
+        pid = self.backend_pid
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+        try:
+            os.waitpid(pid, 0)
+        except ChildProcessError:
+            pass
+        self.backend_pid = None
+        self.finish_backend_terminal()
+
+    def finish_backend_terminal(self):
+        if self.backend_notifier:
+            self.backend_notifier.setEnabled(False)
+            self.backend_notifier.deleteLater()
+            self.backend_notifier = None
+
+        if self.backend_fd is not None:
+            try:
+                os.close(self.backend_fd)
+            except OSError:
+                pass
+            self.backend_fd = None
+
+        if self.backend_pid is not None:
+            try:
+                os.waitpid(self.backend_pid, os.WNOHANG)
+            except ChildProcessError:
+                pass
+            self.backend_pid = None
+
+        self.update_backend_ui()
+
+    def update_backend_ui(self):
+        running = self.backend_pid is not None
+        if hasattr(self, "lbl_backend_status"):
+            self.lbl_backend_status.setText("后端: 运行中" if running else "后端: 未启动")
+            self.lbl_backend_status.setStyleSheet(
+                "color: #58d68d;" if running else "color: #98a2b3;"
+            )
+        if hasattr(self, "btn_backend_start"):
+            self.btn_backend_start.setEnabled(not running)
+        if hasattr(self, "btn_backend_stop"):
+            self.btn_backend_stop.setEnabled(running)
+        if hasattr(self, "terminal_input"):
+            self.terminal_input.setEnabled(running or self.is_connected)
+        if hasattr(self, "btn_terminal_send"):
+            self.btn_terminal_send.setEnabled(running or self.is_connected)
+
+    def read_backend_terminal(self):
+        if self.backend_fd is None:
+            return
+
+        while True:
+            try:
+                data = os.read(self.backend_fd, 4096)
+            except BlockingIOError:
+                return
+            except OSError as exc:
+                if exc.errno in (errno.EIO, errno.EBADF):
+                    self.finish_backend_terminal()
+                    return
+                self.append_terminal(f"! 读取后端终端失败: {exc}")
+                self.finish_backend_terminal()
+                return
+
+            if not data:
+                self.finish_backend_terminal()
+                return
+
+            text = data.decode("utf-8", errors="replace")
+            text = text.replace("\r\n", "\n").replace("\r", "\n")
+            self.append_terminal_raw(text)
+            if "TCP Server listening" in text and not self.is_connected:
+                QTimer.singleShot(100, self.connect_server)
 
     def update_connection_ui(self):
         connected = self.is_connected and self.sock is not None
@@ -501,19 +683,96 @@ class MotorControlApp(QMainWindow):
             self.btn_forward,
             self.btn_reverse,
             self.btn_clear_peak,
-            self.btn_terminal_send,
         ):
             button.setEnabled(connected)
         for button in getattr(self, "preset_buttons", []):
             button.setEnabled(connected)
-        self.terminal_input.setEnabled(connected)
+        self.update_backend_ui()
 
-    def append_terminal(self, message):
+    def reset_can_log_join(self):
+        self.last_can_log_id = None
+        self.last_can_log_time = 0.0
+        self.last_can_log_open = False
+
+    def scroll_terminal_to_bottom(self):
+        scroll_bar = self.terminal_output.verticalScrollBar()
+        scroll_bar.setValue(scroll_bar.maximum())
+
+    def clear_terminal(self):
+        if hasattr(self, "terminal_output"):
+            self.terminal_output.clear()
+        self.reset_can_log_join()
+
+    def append_terminal(self, message, reset_can_join=True):
         if not hasattr(self, "terminal_output"):
             return
         self.terminal_output.appendPlainText(message)
-        scroll_bar = self.terminal_output.verticalScrollBar()
-        scroll_bar.setValue(scroll_bar.maximum())
+        self.scroll_terminal_to_bottom()
+        if reset_can_join:
+            self.reset_can_log_join()
+
+    def append_terminal_raw(self, text):
+        if not hasattr(self, "terminal_output"):
+            return
+        cursor = self.terminal_output.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        cursor.insertText(text)
+        self.terminal_output.setTextCursor(cursor)
+        self.scroll_terminal_to_bottom()
+        self.reset_can_log_join()
+
+    def append_terminal_inline(self, text):
+        if not hasattr(self, "terminal_output"):
+            return
+        cursor = self.terminal_output.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        cursor.insertText(text)
+        self.terminal_output.setTextCursor(cursor)
+        self.scroll_terminal_to_bottom()
+
+    def append_backend_log(self, message):
+        can_id, separator, payload = message.partition(":")
+        is_can_fragment = can_id.startswith("[") and can_id.endswith("]") and separator
+        if not is_can_fragment:
+            self.append_terminal(f"< {message}")
+            return
+
+        self.append_can_log_fragment(can_id, payload)
+
+    def append_can_log_fragment(self, can_id, payload, complete=False):
+        now = time.monotonic()
+        should_join = (
+            self.last_can_log_open
+            and self.last_can_log_id == can_id
+            and now - self.last_can_log_time <= CAN_LOG_JOIN_WINDOW_SEC
+        )
+
+        if should_join:
+            self.append_terminal_inline(payload)
+        else:
+            self.append_terminal(f"< {can_id}:{payload}", reset_can_join=False)
+
+        self.last_can_log_id = can_id
+        self.last_can_log_time = now
+        self.last_can_log_open = not complete
+
+    def append_can_packet_log(self, raw_line):
+        parts = raw_line.split(" ", 3)
+        if len(parts) < 4:
+            self.append_terminal(f"< {raw_line}")
+            return
+
+        _, can_id, complete, payload = parts
+        self.append_can_log_fragment(f"[{can_id}]", payload, complete == "1")
+
+    def append_can_line_log(self, raw_line):
+        parts = raw_line.split(" ", 2)
+        if len(parts) < 3:
+            self.append_terminal(f"< {raw_line}")
+            return
+
+        _, can_id, payload = parts
+        self.append_terminal(f"< [{can_id}]:{payload}")
 
     def format_command_for_log(self, command):
         if isinstance(command, bytes):
@@ -523,13 +782,24 @@ class MotorControlApp(QMainWindow):
         return text.rstrip("\r\n")
 
     def send_terminal_command(self):
-        command = self.terminal_input.text().strip()
+        command = self.terminal_input.text()
+        self.terminal_input.clear()
+
+        if self.backend_running() and self.backend_fd is not None:
+            try:
+                os.write(self.backend_fd, f"{command}\n".encode("utf-8"))
+            except OSError as exc:
+                self.append_terminal(f"! 后端输入失败: {exc}")
+                self.finish_backend_terminal()
+            return
+
+        command = command.strip()
         if not command:
             return
-        self.terminal_input.clear()
         if not self.is_connected:
-            self.append_terminal("! 未连接，命令未发送")
+            self.append_terminal("! 后端未启动且 TCP 未连接，命令未发送")
             return
+
         self.send_command(f"{command}\n")
 
     def send_command(self, command, log_command=True):
@@ -562,10 +832,12 @@ class MotorControlApp(QMainWindow):
                     self.append_terminal(f"! {message}")
                     self.disconnect_all()
                     return
-                self.rx_buffer += data.decode("utf-8", errors="ignore")
-                lines = self.rx_buffer.split("\n")
+                self.rx_buffer += data
+                lines = self.rx_buffer.split(b"\n")
                 self.rx_buffer = lines.pop()
-                self.parse_telemetry(lines)
+                self.parse_telemetry(
+                    line.decode("utf-8", errors="replace") for line in lines
+                )
         except BlockingIOError:
             return
         except (ConnectionResetError, BrokenPipeError, OSError) as exc:
@@ -584,13 +856,24 @@ class MotorControlApp(QMainWindow):
             key = parts[0].strip()
             if key == "POS_WITH_VEL_COMPLETE":
                 self.target_vel = 0.0
-                self.append_terminal("< POS_WITH_VEL_COMPLETE")
+                if self.backend_pid is None:
+                    self.append_terminal("< POS_WITH_VEL_COMPLETE")
+                continue
+            if key == "LOG_CAN_LINE":
+                if self.backend_pid is None:
+                    self.append_can_line_log(raw_line)
+                continue
+            if key == "LOG_CAN":
+                if self.backend_pid is None:
+                    self.append_can_packet_log(raw_line)
                 continue
             if key == "LOG":
-                self.append_terminal(f"< {raw_line[4:]}")
+                if self.backend_pid is None:
+                    self.append_backend_log(raw_line[4:])
                 continue
             if key not in TELEMETRY_KEYS:
-                self.append_terminal(f"< {raw_line}")
+                if self.backend_pid is None:
+                    self.append_terminal(f"< {raw_line}")
                 continue
             if len(parts) < 2:
                 continue
@@ -767,6 +1050,8 @@ class MotorControlApp(QMainWindow):
 
     def closeEvent(self, event):
         self.disconnect_all()
+        if self.backend_pid is not None:
+            self.force_stop_backend_terminal()
         event.accept()
 
 

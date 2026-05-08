@@ -23,6 +23,8 @@
 // TCP服务器相关定义
 #define SERVER_PORT 9999
 #define BUFFER_SIZE 1024
+#define CAN_TEXT_LOG_SLOTS 8
+#define CAN_TEXT_LOG_BUFFER_SIZE 2048
 #define PI_F 3.1415926f
 #define RAD_TO_DEG(rad) ((rad) / PI_F * 180.0f)
 #define DEG_TO_RAD(deg) ((deg) / 180.0f * PI_F)
@@ -70,8 +72,17 @@ typedef struct
     int protocol;
 }motor_mit;
 
+typedef struct
+{
+    unsigned int can_id;
+    char text[CAN_TEXT_LOG_BUFFER_SIZE];
+    size_t len;
+    int active;
+} can_text_log;
+
 #define MOTOR_NUM   2
 motor_mit g_motor[MOTOR_NUM];
+static can_text_log g_can_text_logs[CAN_TEXT_LOG_SLOTS];
 
 // 函数声明
 int set_motor_tor(motor_mit *motor, float tor);
@@ -96,6 +107,90 @@ static int tcp_send_log(int fd, const char *fmt, ...)
 
     snprintf(message, sizeof(message), "LOG %s\n", body);
     return tcp_send_text(fd, message);
+}
+
+static int tcp_send_can_line_if_connected(unsigned int can_id, const char *text)
+{
+    char message[CAN_TEXT_LOG_BUFFER_SIZE + 64];
+
+    if (client_fd <= 0) {
+        return 0;
+    }
+
+    snprintf(message, sizeof(message), "LOG_CAN_LINE %u %s\n", can_id, text);
+    return tcp_send_text(client_fd, message);
+}
+
+static void can_text_log_flush(can_text_log *log);
+
+static can_text_log *can_text_log_get(unsigned int can_id)
+{
+    can_text_log *empty = NULL;
+
+    for (int i = 0; i < CAN_TEXT_LOG_SLOTS; i++) {
+        if (g_can_text_logs[i].active && g_can_text_logs[i].can_id == can_id) {
+            return &g_can_text_logs[i];
+        }
+        if (!g_can_text_logs[i].active && !empty) {
+            empty = &g_can_text_logs[i];
+        }
+    }
+
+    if (!empty) {
+        empty = &g_can_text_logs[0];
+        can_text_log_flush(empty);
+    }
+
+    empty->active = 1;
+    empty->can_id = can_id;
+    empty->len = 0;
+    empty->text[0] = '\0';
+    return empty;
+}
+
+static void can_text_log_flush(can_text_log *log)
+{
+    if (!log || !log->active) {
+        return;
+    }
+
+    while (log->len > 0 &&
+           (log->text[log->len - 1] == ' ' || log->text[log->len - 1] == '\t')) {
+        log->len--;
+    }
+    log->text[log->len] = '\0';
+
+    if (log->len > 0) {
+        printf("[%u]:%s\n", log->can_id, log->text);
+        tcp_send_can_line_if_connected(log->can_id, log->text);
+    }
+
+    log->len = 0;
+    log->text[0] = '\0';
+}
+
+static void can_text_log_append_frame(unsigned int can_id, const unsigned char *data, int len)
+{
+    can_text_log *log = can_text_log_get(can_id);
+
+    for (int i = 0; i < len; i++) {
+        unsigned char ch = data[i];
+
+        if (ch == '\0') {
+            continue;
+        }
+        if (ch == '\r' || ch == '\n') {
+            can_text_log_flush(log);
+            continue;
+        }
+
+        if (log->len >= sizeof(log->text) - 1) {
+            can_text_log_flush(log);
+        }
+
+        log->text[log->len++] = (char)ch;
+        log->text[log->len] = '\0';
+    }
 }
 
 static float clamp_float(float value, float min_value, float max_value)
@@ -410,11 +505,7 @@ int motor_test_can_call(void *arg, void *arg2, char *buf, int len)
     }
     else
     {
-        printf("[%d]:", frame->can_id);
-        for(int i = 0; i < frame->can_dlc; i++){
-            printf("%c", frame->data[i]);
-        }
-        printf("\n\r");
+        can_text_log_append_frame(frame->can_id, frame->data, frame->can_dlc);
         return 0;
     }
 

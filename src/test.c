@@ -26,6 +26,8 @@
 #define CAN_TEXT_LOG_SLOTS 8
 #define CAN_TEXT_LOG_BUFFER_SIZE 2048
 #define PI_F 3.1415926f
+#define TEMP_MIN_C -30.0f
+#define TEMP_MAX_C 150.0f
 #define RAD_TO_DEG(rad) ((rad) / PI_F * 180.0f)
 #define DEG_TO_RAD(deg) ((deg) / 180.0f * PI_F)
 
@@ -63,6 +65,8 @@ typedef struct
 {
     joint_control control;
     joint_state state;
+    float temp_mos;
+    float temp_rotor;
     pid_control pid;
     mHandle can;
     mit_param param;
@@ -574,6 +578,8 @@ int motor_test_can_call(void *arg, void *arg2, char *buf, int len)
     motor->state.p = p;
     motor->state.v = v;
     motor->state.t = t;
+    motor->temp_mos = uint_to_float(frame->data[6], TEMP_MIN_C, TEMP_MAX_C, 8);
+    motor->temp_rotor = uint_to_float(frame->data[7], TEMP_MIN_C, TEMP_MAX_C, 8);
 
     return 0;
 
@@ -674,7 +680,7 @@ void *commu_thread(void *arg)
         
         // 发送状态数据到客户端
         if (client_fd > 0) {
-            char msg[384];
+            char msg[512];
             float sensor_torque = NAN;
             float sensor_speed = NAN;
             float sensor_power = NAN;
@@ -685,14 +691,20 @@ void *commu_thread(void *arg)
 
             snprintf(msg, sizeof(msg),
                     "TORQUE1 %.2f\nPOS1 %.2f\nVEL1 %.2f\n"
+                    "TEMP_MOS1 %.2f\nTEMP_ROTOR1 %.2f\n"
                     "TORQUE2 %.2f\nPOS2 %.2f\nVEL2 %.2f\n"
+                    "TEMP_MOS2 %.2f\nTEMP_ROTOR2 %.2f\n"
                     "SENSOR_TORQUE %.3f\nSENSOR_SPEED %.3f\n",
                     g_motor[0].state.t, 
                     RAD_TO_DEG(g_motor[0].state.p),
                     RAD_TO_DEG(g_motor[0].state.v),
+                    g_motor[0].temp_mos,
+                    g_motor[0].temp_rotor,
                     g_motor[1].state.t,
                     RAD_TO_DEG(g_motor[1].state.p),
                     RAD_TO_DEG(g_motor[1].state.v),
+                    g_motor[1].temp_mos,
+                    g_motor[1].temp_rotor,
                     sensor_torque,
                     sensor_speed);
             send(client_fd, msg, strlen(msg), 0);

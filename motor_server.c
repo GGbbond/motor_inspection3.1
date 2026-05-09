@@ -41,7 +41,7 @@ typedef int SOCKET;
 #define TORQUE_SMOOTHING 0.25
 #define RECV_BUFFER_SIZE 1024
 #define COMMAND_BUFFER_SIZE 2048
-#define TELEMETRY_BUFFER_SIZE 256
+#define TELEMETRY_BUFFER_SIZE 384
 
 typedef struct {
     double target_torque;
@@ -51,6 +51,8 @@ typedef struct {
     double velocity;
     double move_velocity;
     double max_torque;
+    double temp_mos;
+    double temp_rotor;
     int enabled;
     int moving;
     int completion_pending;
@@ -133,6 +135,8 @@ static void motor_init(MotorSimulator *motor)
     memset(motor, 0, sizeof(*motor));
     motor->move_velocity = DEFAULT_MOVE_VEL_DEG_S;
     motor->max_torque = DEFAULT_MAX_TORQUE_NM;
+    motor->temp_mos = 32.0;
+    motor->temp_rotor = 30.0;
 }
 
 static void motor_disable(MotorSimulator *motor)
@@ -194,10 +198,14 @@ static void motor_update(MotorSimulator *motor, double dt)
     if (!motor->enabled) {
         motor->velocity = 0.0;
         motor->current_torque = 0.0;
+        motor->temp_mos = 32.0;
+        motor->temp_rotor = 30.0;
         return;
     }
 
     motor->current_torque += (motor->target_torque - motor->current_torque) * TORQUE_SMOOTHING;
+    motor->temp_mos = 32.0 + fabs(motor->current_torque) * 0.2;
+    motor->temp_rotor = 30.0 + fabs(motor->current_torque) * 0.3;
 
     if (motor->moving) {
         double error = motor->target_pos - motor->current_pos;
@@ -527,13 +535,19 @@ static void build_telemetry(char *buffer, size_t size)
 
     snprintf(buffer, size,
              "TORQUE1 %.2f\nPOS1 %.2f\nVEL1 %.2f\n"
-             "TORQUE2 %.2f\nPOS2 %.2f\nVEL2 %.2f\n%s",
+             "TEMP_MOS1 %.2f\nTEMP_ROTOR1 %.2f\n"
+             "TORQUE2 %.2f\nPOS2 %.2f\nVEL2 %.2f\n"
+             "TEMP_MOS2 %.2f\nTEMP_ROTOR2 %.2f\n%s",
              g_motors[DRIVE_MOTOR].current_torque,
              g_motors[DRIVE_MOTOR].current_pos,
              g_motors[DRIVE_MOTOR].velocity,
+             g_motors[DRIVE_MOTOR].temp_mos,
+             g_motors[DRIVE_MOTOR].temp_rotor,
              g_motors[LOAD_MOTOR].current_torque,
              g_motors[LOAD_MOTOR].current_pos,
              g_motors[LOAD_MOTOR].velocity,
+             g_motors[LOAD_MOTOR].temp_mos,
+             g_motors[LOAD_MOTOR].temp_rotor,
              complete ? "POS_WITH_VEL_COMPLETE\n" : "");
     mutex_unlock();
 }

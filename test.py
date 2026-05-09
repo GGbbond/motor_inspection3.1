@@ -60,9 +60,13 @@ TELEMETRY_KEYS = {
     "TORQUE1",
     "POS1",
     "VEL1",
+    "TEMP_MOS1",
+    "TEMP_ROTOR1",
     "TORQUE2",
     "POS2",
     "VEL2",
+    "TEMP_MOS2",
+    "TEMP_ROTOR2",
     "SENSOR_TORQUE",
     "SENSOR_SPEED",
 }
@@ -73,8 +77,15 @@ MOTOR_PRESETS = {
     "Bxi_motor_70": ("70 标准", 80.0, 10.0, 0.35),
     "Bxi_motor_85": ("85 标准", 160.0, 25.0, 0.50),
 }
-MOTOR_MODEL_PATTERN = re.compile(
-    r"\[(?P<source>\d+)\]:(?P<model>Bxi_motor_50L|Bxi_motor_50|Bxi_motor_70|Bxi_motor_85)\b"
+MOTOR_PROGRAM_TO_MODEL = {
+    "motor_50": "Bxi_motor_50",
+    "motor_50_L": "Bxi_motor_50L",
+    "motor_70": "Bxi_motor_70",
+    "motor_85": "Bxi_motor_85",
+}
+MOTOR_PROGRAM_PATTERN = re.compile(
+    r"\[(?P<source>\d+)\]:Program\s+for\s+"
+    r"(?P<program>motor_50_L|motor_50|motor_70|motor_85)\b"
 )
 MOTOR_CAN_ID_PATTERN = re.compile(r"\[(?P<source>\d+)\]:Set CAN ID to (?P<can_id>\d+)")
 
@@ -84,6 +95,8 @@ class MotorSample:
     torque: float = 0.0
     position: float = 0.0
     velocity: float = 0.0
+    temp_mos: float = 0.0
+    temp_rotor: float = 0.0
 
 
 class MotorControlApp(QMainWindow):
@@ -389,6 +402,8 @@ class MotorControlApp(QMainWindow):
             ("torque", "扭矩 (Nm)", "0.00"),
             ("position", "位置 (deg)", "0.00"),
             ("velocity", "速度 (deg/s)", "0.00"),
+            ("temp_mos", "MOS 温度 (℃)", "0.00"),
+            ("temp_rotor", "线圈温度 (℃)", "0.00"),
         )
         for row, (metric, title, initial_value) in enumerate(metrics, start=1):
             metric_label = QLabel(title)
@@ -503,19 +518,14 @@ class MotorControlApp(QMainWindow):
         status_label.setProperty("role", "value")
         model_label = QLabel("--")
         model_label.setProperty("role", "value")
-        torque_label = QLabel("--")
-        torque_label.setProperty("role", "value")
 
         self.motor_detect_status_labels.append(status_label)
         self.motor_detect_model_labels.append(model_label)
-        self.motor_detect_torque_labels.append(torque_label)
 
         layout.addWidget(QLabel("识别状态"), 0, 0)
         layout.addWidget(status_label, 0, 1)
         layout.addWidget(QLabel("电机 1 型号"), 1, 0)
         layout.addWidget(model_label, 1, 1)
-        layout.addWidget(QLabel("最大扭矩"), 2, 0)
-        layout.addWidget(torque_label, 2, 1)
         self.update_motor_identity_ui()
         return group
 
@@ -1053,9 +1063,10 @@ class MotorControlApp(QMainWindow):
             if can_id == 1 and source in self.motor_models_by_source:
                 self.handle_detected_motor_model(self.motor_models_by_source[source])
 
-        for model_match in MOTOR_MODEL_PATTERN.finditer(line):
-            source = model_match.group("source")
-            model = model_match.group("model")
+        for program_match in MOTOR_PROGRAM_PATTERN.finditer(line):
+            source = program_match.group("source")
+            program = program_match.group("program")
+            model = MOTOR_PROGRAM_TO_MODEL[program]
             self.motor_models_by_source[source] = model
             if self.motor_source_can_ids.get(source) == 1:
                 self.handle_detected_motor_model(model)
@@ -1434,12 +1445,20 @@ class MotorControlApp(QMainWindow):
                 self.motor_1.position = value
             elif key == "VEL1":
                 self.motor_1.velocity = value
+            elif key == "TEMP_MOS1":
+                self.motor_1.temp_mos = value
+            elif key == "TEMP_ROTOR1":
+                self.motor_1.temp_rotor = value
             elif key == "TORQUE2":
                 self.motor_2.torque = value
             elif key == "POS2":
                 self.motor_2.position = value
             elif key == "VEL2":
                 self.motor_2.velocity = value
+            elif key == "TEMP_MOS2":
+                self.motor_2.temp_mos = value
+            elif key == "TEMP_ROTOR2":
+                self.motor_2.temp_rotor = value
             elif key == "SENSOR_TORQUE":
                 self.sensor_torque = value
                 sensor_updated = True
@@ -1570,9 +1589,13 @@ class MotorControlApp(QMainWindow):
         self.value_labels["motor1_torque"].setText(f"{self.motor_1.torque:.2f}")
         self.value_labels["motor1_position"].setText(f"{self.motor_1.position:.2f}")
         self.value_labels["motor1_velocity"].setText(f"{abs(self.motor_1.velocity):.2f}")
+        self.value_labels["motor1_temp_mos"].setText(f"{self.motor_1.temp_mos:.2f}")
+        self.value_labels["motor1_temp_rotor"].setText(f"{self.motor_1.temp_rotor:.2f}")
         self.value_labels["motor2_torque"].setText(f"{self.motor_2.torque:.2f}")
         self.value_labels["motor2_position"].setText(f"{self.motor_2.position:.2f}")
         self.value_labels["motor2_velocity"].setText(f"{abs(self.motor_2.velocity):.2f}")
+        self.value_labels["motor2_temp_mos"].setText(f"{self.motor_2.temp_mos:.2f}")
+        self.value_labels["motor2_temp_rotor"].setText(f"{self.motor_2.temp_rotor:.2f}")
         self.lbl_sensor_torque.setText(self.format_sensor_value(self.sensor_torque, "Nm"))
         self.lbl_sensor_speed.setText(self.format_sensor_value(self.sensor_speed, "rpm"))
         self.update_sensor_peak_ui()

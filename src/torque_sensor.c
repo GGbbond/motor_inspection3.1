@@ -1,10 +1,19 @@
 #include <stdint.h>
+#include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <stdarg.h>
 #include <unistd.h>
 #include <pthread.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
 #include "uart_op.h"
+
+#define DY200_CRC_RECONNECT_LIMIT 3
+#define DY200_RECONNECT_DELAY_US (1000 * 500)
+#define DY200_RECONNECT_COOLDOWN_US (1000 * 1000)
+#define DY200_LOG_INTERVAL_US (1000LL * 1000LL * 5LL)
 
 static uint16_t MODBUS_CRC16(unsigned char *buf, unsigned int len )
 {
@@ -55,99 +64,353 @@ static uint16_t MODBUS_CRC16(unsigned char *buf, unsigned int len )
 	return crc;
 }
 
-// static int g_fd = 0;
-// static char dev_name[128];
-// static int dev_bud = 0;
-volatile static float g_torque = 0;
-volatile static float g_speed = 0;
-volatile static float g_power = 0;
+static pthread_mutex_t g_sensor_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_t t_id;
+static int g_started = 0;
+static int g_valid = 0;
+static int g_fd = -1;
+static int g_reconnect_requested = 0;
+static int g_stop_requested = 0;
+static char g_dev[128] = {0};
+static int g_baud = 115200;
+static float g_torque = 0.0f;
+static float g_speed = 0.0f;
+static float g_power = 0.0f;
 
-#define SWAP_UINT16(x) (((x) >> 8) | ((x) << 8))
-void *dy200_thread(void *arg)
+static int dy200_should_stop(void);
+
+static long long monotonic_us(void)
 {
-    int fd = (long)arg;
-    uint16_t crc = 0;
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000000LL + ts.tv_nsec / 1000LL;
+}
+
+static void log_rate_limited(long long *last_log_us, const char *fmt, ...)
+{
+    long long now = monotonic_us();
+    va_list args;
+
+    if (*last_log_us != 0 && now - *last_log_us < DY200_LOG_INTERVAL_US) {
+        return;
+    }
+
+    *last_log_us = now;
+    va_start(args, fmt);
+    vprintf(fmt, args);
+    va_end(args);
+}
+
+static void mark_sensor_invalid(void)
+{
+    pthread_mutex_lock(&g_sensor_lock);
+    g_valid = 0;
+    pthread_mutex_unlock(&g_sensor_lock);
+}
+
+static int read_exact(int fd, unsigned char *buf, int len)
+{
     int index = 0;
-    int read_len = 0;
-    int rest_len = 0;
-    char uart_raw_buf[16];
 
-    uint16_t torque = 0;
-    uint16_t speed = 0;
-    
-    
-
-    uart_flush(fd);
-    usleep(10);
-    uart_flush(fd);
-    usleep(10);
-    uart_flush(fd);
-
-    while (1) {
-    
-        index = 0;
-        rest_len = 6;
-        while (rest_len) {
-            read_len = uart_recv(fd, uart_raw_buf + index, rest_len);
-            rest_len -= read_len;
-            index += read_len;
+    while (index < len) {
+        if (dy200_should_stop()) {
+            return -1;
         }
 
-        crc = *((uint16_t *)(&uart_raw_buf[4]));
-        if (MODBUS_CRC16((uint8_t *)uart_raw_buf, 4) != crc) {
-            printf("crc check failed!\n");
-            uart_flush(fd);
-            usleep(10);
-            uart_flush(fd);
-            usleep(10);
-            uart_flush(fd);
+        int read_len = uart_recv(fd, (char *)buf + index, len - index);
+        if (read_len > 0) {
+            index += read_len;
             continue;
         }
 
-        torque = *((uint16_t *)(&uart_raw_buf[0]));
-        speed = *((uint16_t *)(&uart_raw_buf[2]));
+        if (read_len == 0 || errno == EINTR || errno == EAGAIN) {
+            usleep(1000);
+            continue;
+        }
 
-        torque = SWAP_UINT16(torque);
-        speed = SWAP_UINT16(speed);
-
-        g_torque = torque/10.f * ((speed & 0x8000) ? -1 : 1);
-        g_speed = speed & 0x7FFF;
-        g_power = g_torque * g_speed * (M_PI/30.f);
-
+        return -1;
     }
+
+    return 0;
 }
 
+static void update_sensor_values(float torque, float speed, float power)
+{
+    pthread_mutex_lock(&g_sensor_lock);
+    g_torque = torque;
+    g_speed = speed;
+    g_power = power;
+    g_valid = 1;
+    pthread_mutex_unlock(&g_sensor_lock);
+}
 
-pthread_t t_id;
+static void set_active_fd(int fd)
+{
+    pthread_mutex_lock(&g_sensor_lock);
+    g_fd = fd;
+    pthread_mutex_unlock(&g_sensor_lock);
+}
+
+static int take_reconnect_request(void)
+{
+    int requested;
+
+    pthread_mutex_lock(&g_sensor_lock);
+    requested = g_reconnect_requested;
+    g_reconnect_requested = 0;
+    pthread_mutex_unlock(&g_sensor_lock);
+    return requested;
+}
+
+static int dy200_should_stop(void)
+{
+    int requested;
+
+    pthread_mutex_lock(&g_sensor_lock);
+    requested = g_stop_requested;
+    pthread_mutex_unlock(&g_sensor_lock);
+    return requested;
+}
+
+static void finish_sensor_thread(int fd)
+{
+    if (fd > 0) {
+        close(fd);
+    }
+
+    pthread_mutex_lock(&g_sensor_lock);
+    g_started = 0;
+    g_valid = 0;
+    g_fd = -1;
+    g_reconnect_requested = 0;
+    g_stop_requested = 0;
+    pthread_mutex_unlock(&g_sensor_lock);
+}
+
+static void flush_sensor_uart(int fd)
+{
+    uart_flush(fd);
+    usleep(1000);
+    uart_flush(fd);
+    usleep(1000);
+    uart_flush(fd);
+}
+
+static int open_configured_sensor(void)
+{
+    char dev[sizeof(g_dev)];
+    int baud;
+
+    pthread_mutex_lock(&g_sensor_lock);
+    snprintf(dev, sizeof(dev), "%s", g_dev);
+    baud = g_baud;
+    pthread_mutex_unlock(&g_sensor_lock);
+
+    return uart_open_normal(dev, baud, 0);
+}
+
+static int reconnect_sensor(int fd)
+{
+    static long long last_reconnect_log_us = 0;
+
+    if (fd > 0) {
+        close(fd);
+    }
+
+    mark_sensor_invalid();
+    usleep(DY200_RECONNECT_COOLDOWN_US);
+
+    while (!dy200_should_stop()) {
+        int new_fd = open_configured_sensor();
+        if (new_fd > 0) {
+            log_rate_limited(&last_reconnect_log_us, "dy200 reconnected\n");
+            set_active_fd(new_fd);
+            flush_sensor_uart(new_fd);
+            return new_fd;
+        }
+
+        log_rate_limited(&last_reconnect_log_us, "dy200 reconnect failed\n");
+        usleep(DY200_RECONNECT_DELAY_US);
+    }
+
+    return -1;
+}
+
+void *dy200_thread(void *arg)
+{
+    int fd = (long)arg;
+    int crc_error_count = 0;
+    long long last_read_log_us = 0;
+    long long last_crc_log_us = 0;
+    unsigned char uart_raw_buf[6];
+
+    flush_sensor_uart(fd);
+
+    while (!dy200_should_stop()) {
+        uint16_t received_crc;
+        uint16_t calc_crc;
+        uint16_t raw_torque;
+        uint16_t raw_speed;
+        float torque;
+        float speed;
+        float power;
+
+        if (take_reconnect_request()) {
+            fd = reconnect_sensor(fd);
+            if (fd < 0) {
+                break;
+            }
+            crc_error_count = 0;
+            continue;
+        }
+
+        if (read_exact(fd, uart_raw_buf, sizeof(uart_raw_buf)) != 0) {
+            if (dy200_should_stop()) {
+                break;
+            }
+            log_rate_limited(&last_read_log_us, "dy200 read failed, reconnecting\n");
+            fd = reconnect_sensor(fd);
+            if (fd < 0) {
+                break;
+            }
+            crc_error_count = 0;
+            continue;
+        }
+
+        received_crc = (uint16_t)uart_raw_buf[4] | ((uint16_t)uart_raw_buf[5] << 8);
+        calc_crc = MODBUS_CRC16(uart_raw_buf, 4);
+        if (calc_crc != received_crc) {
+            crc_error_count++;
+            if (crc_error_count >= DY200_CRC_RECONNECT_LIMIT) {
+                log_rate_limited(
+                    &last_crc_log_us,
+                    "dy200 crc failed %d consecutive times, reconnecting\n",
+                    crc_error_count
+                );
+                fd = reconnect_sensor(fd);
+                if (fd < 0) {
+                    break;
+                }
+                crc_error_count = 0;
+            } else {
+                flush_sensor_uart(fd);
+            }
+            continue;
+        }
+
+        crc_error_count = 0;
+
+        raw_torque = ((uint16_t)uart_raw_buf[0] << 8) | uart_raw_buf[1];
+        raw_speed = ((uint16_t)uart_raw_buf[2] << 8) | uart_raw_buf[3];
+
+        torque = raw_torque / 10.0f * ((raw_speed & 0x8000) ? -1.0f : 1.0f);
+        speed = raw_speed & 0x7FFF;
+        power = torque * speed * (M_PI / 30.0f);
+        update_sensor_values(torque, speed, power);
+    }
+
+    finish_sensor_thread(fd);
+    return NULL;
+}
+
 int dy200_init(char *dev, int bud)
 {   
     int fd = 0;
-    // dev_bud = bud;
-    // strcpy(dev_name, dev);
 
-    fd = uart_open_normal(dev, bud, 1);
+    pthread_mutex_lock(&g_sensor_lock);
+    if (g_started) {
+        snprintf(g_dev, sizeof(g_dev), "%s", dev);
+        g_baud = bud;
+        g_valid = 0;
+        g_reconnect_requested = 1;
+        pthread_mutex_unlock(&g_sensor_lock);
+        return 0;
+    }
+    snprintf(g_dev, sizeof(g_dev), "%s", dev);
+    g_baud = bud;
+    g_stop_requested = 0;
+    pthread_mutex_unlock(&g_sensor_lock);
+
+    fd = uart_open_normal(dev, bud, 0);
     if (fd <= 0 ) {
         printf("dev:%s, open failed\n", dev);
+        pthread_mutex_lock(&g_sensor_lock);
+        g_dev[0] = '\0';
+        pthread_mutex_unlock(&g_sensor_lock);
         return  -1;
     }
 
     if (-1 == pthread_create(&t_id, NULL, dy200_thread, (void *)(long)fd))
     {
         printf("dy200 thread create failed.\n");
+        close(fd);
         return -1;
     }  
+
+    set_active_fd(fd);
+
+    pthread_mutex_lock(&g_sensor_lock);
+    g_started = 1;
+    g_valid = 0;
+    pthread_mutex_unlock(&g_sensor_lock);
 
     return 0;  
 }
 
+void dy200_shutdown(void)
+{
+    pthread_t thread;
+    int should_join = 0;
+
+    pthread_mutex_lock(&g_sensor_lock);
+    if (g_started) {
+        g_stop_requested = 1;
+        g_reconnect_requested = 0;
+        g_valid = 0;
+        thread = t_id;
+        should_join = 1;
+    }
+    pthread_mutex_unlock(&g_sensor_lock);
+
+    if (should_join) {
+        pthread_join(thread, NULL);
+    }
+}
+
 int get_dy200_info(float *torque, float *speed, float *power)
 {
+    int valid;
+
+    pthread_mutex_lock(&g_sensor_lock);
     if (torque)
         *torque = g_torque;
     if (speed)
         *speed = g_speed;
     if (power)
         *power = g_power;
+    valid = g_valid;
+    pthread_mutex_unlock(&g_sensor_lock);
 
-    return 0;
+    return valid ? 0 : -1;
+}
+
+int dy200_is_running(void)
+{
+    int started;
+
+    pthread_mutex_lock(&g_sensor_lock);
+    started = g_started;
+    pthread_mutex_unlock(&g_sensor_lock);
+    return started;
+}
+
+int dy200_has_valid_data(void)
+{
+    int valid;
+
+    pthread_mutex_lock(&g_sensor_lock);
+    valid = g_valid;
+    pthread_mutex_unlock(&g_sensor_lock);
+    return valid;
 }

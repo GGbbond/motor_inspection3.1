@@ -1,3 +1,5 @@
+#define _DEFAULT_SOURCE
+
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -392,6 +394,24 @@ static void handle_disable(void)
     send_client_log("Disabled simulated motors");
 }
 
+static void handle_enable(void)
+{
+    mutex_lock();
+    stop_load_profile();
+    for (int i = 0; i < MOTOR_COUNT; i++) {
+        g_motors[i].enabled = 1;
+        g_motors[i].moving = 0;
+        g_motors[i].velocity = 0.0;
+        g_motors[i].target_torque = 0.0;
+        g_motors[i].current_torque = 0.0;
+        g_motors[i].target_pos = g_motors[i].current_pos;
+        g_motors[i].completion_pending = 0;
+    }
+    mutex_unlock();
+    printf("Enabled simulated motors for position check\n");
+    send_client_log("Enabled simulated motors for position check");
+}
+
 static void handle_set_max_torque(double max_torque)
 {
     char reply[64];
@@ -442,6 +462,11 @@ static void process_command(const char *line)
 
     if (strncmp(line, "DISABLE_MOTOR", 13) == 0) {
         handle_disable();
+        return;
+    }
+
+    if (strncmp(line, "ENABLE_MOTOR", 12) == 0) {
+        handle_enable();
         return;
     }
 

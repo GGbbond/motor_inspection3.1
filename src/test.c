@@ -233,6 +233,19 @@ static void set_all_motors_enabled(int enable)
     }
 }
 
+static void enable_all_motors_without_motion(void)
+{
+    for (int i = 0; i < MOTOR_NUM; i++) {
+        g_motor[i].protocol = 0;
+        g_motor[i].control.p_des = g_motor[i].state.p;
+        g_motor[i].control.v_des = 0.0f;
+        g_motor[i].control.t_ff = 0.0f;
+        g_motor[i].control.kp = (i == 0) ? 300.0f : 0.0f;
+        g_motor[i].control.kd = (i == 0) ? 5.0f : 0.0f;
+        motor_enable(&g_motor[i], 1);
+    }
+}
+
 static void set_all_max_torque(float max_torque)
 {
     for (int i = 0; i < MOTOR_NUM; i++) {
@@ -320,6 +333,36 @@ static void handle_pos_with_velocity_command(int client_socket, char *command)
     tcp_send_text(client_socket, "POS_WITH_VEL_COMPLETE\n");
 }
 
+static void handle_dy200_connect_command(int client_socket, char *command)
+{
+    char dev[128] = {0};
+    int baud = 115200;
+    int parsed;
+
+    parsed = sscanf(command, "DY200_CONNECT %127s %d", dev, &baud);
+    if (parsed < 1) {
+        tcp_send_text(client_socket, "DY200_CONNECT_FAILED\n");
+        tcp_send_log(client_socket, "DYN200 connect failed: invalid command");
+        return;
+    }
+
+    if (dy200_init(dev, baud) != 0) {
+        tcp_send_text(client_socket, "DY200_CONNECT_FAILED\n");
+        tcp_send_log(client_socket, "DYN200 connect failed: dev=%s baud=%d", dev, baud);
+        return;
+    }
+
+    tcp_send_text(client_socket, "DY200_CONNECTED\n");
+    tcp_send_log(client_socket, "DYN200 connected: dev=%s baud=%d", dev, baud);
+}
+
+static void handle_dy200_disconnect_command(int client_socket)
+{
+    dy200_shutdown();
+    tcp_send_text(client_socket, "DY200_DISCONNECTED\n");
+    tcp_send_log(client_socket, "DYN200 disconnected");
+}
+
 static void handle_tcp_command(int client_socket, char *command)
 {
     if (strncmp(command, "SET_TORQUE", 10) == 0) {
@@ -352,6 +395,11 @@ static void handle_tcp_command(int client_socket, char *command)
         printf("Motor disabled\n");
         tcp_send_log(client_socket, "Motor disabled");
     }
+    else if (strncmp(command, "ENABLE_MOTOR", 12) == 0) {
+        enable_all_motors_without_motion();
+        printf("Motor enabled for position check\n");
+        tcp_send_log(client_socket, "Motor enabled for position check");
+    }
     else if (strncmp(command, "SET_MAX_TORQUE", 14) == 0) {
         char result[64];
         float max_torque = atof(command + 15);
@@ -360,6 +408,12 @@ static void handle_tcp_command(int client_socket, char *command)
         tcp_send_text(client_socket, result);
         printf("Set max torque: %.2f\n", max_torque);
         tcp_send_log(client_socket, "Set max torque: %.2f", max_torque);
+    }
+    else if (strncmp(command, "DY200_CONNECT", 13) == 0) {
+        handle_dy200_connect_command(client_socket, command);
+    }
+    else if (strncmp(command, "DY200_DISCONNECT", 16) == 0) {
+        handle_dy200_disconnect_command(client_socket);
     }
 }
 
@@ -620,14 +674,27 @@ void *commu_thread(void *arg)
         
         // 发送状态数据到客户端
         if (client_fd > 0) {
-            char msg[256];
-            snprintf(msg, sizeof(msg), "TORQUE1 %.2f\nPOS1 %.2f\nVEL1 %.2f\nTORQUE2 %.2f\nPOS2 %.2f\nVEL2 %.2f\n", 
+            char msg[384];
+            float sensor_torque = NAN;
+            float sensor_speed = NAN;
+            float sensor_power = NAN;
+            if (get_dy200_info(&sensor_torque, &sensor_speed, &sensor_power) != 0) {
+                sensor_torque = NAN;
+                sensor_speed = NAN;
+            }
+
+            snprintf(msg, sizeof(msg),
+                    "TORQUE1 %.2f\nPOS1 %.2f\nVEL1 %.2f\n"
+                    "TORQUE2 %.2f\nPOS2 %.2f\nVEL2 %.2f\n"
+                    "SENSOR_TORQUE %.3f\nSENSOR_SPEED %.3f\n",
                     g_motor[0].state.t, 
                     RAD_TO_DEG(g_motor[0].state.p),
                     RAD_TO_DEG(g_motor[0].state.v),
                     g_motor[1].state.t,
                     RAD_TO_DEG(g_motor[1].state.p),
-                    RAD_TO_DEG(g_motor[1].state.v));
+                    RAD_TO_DEG(g_motor[1].state.v),
+                    sensor_torque,
+                    sensor_speed);
             send(client_fd, msg, strlen(msg), 0);
             usleep(1000*10);
         }
